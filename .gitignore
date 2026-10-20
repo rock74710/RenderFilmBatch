@@ -1,0 +1,10 @@
+.claude/
+.codex/
+.worktrees/
+.build/
+build/
+.swiftpm/
+*.rfedit.json
+.DS_Store
+**/__pycache__/
+sampleraw/
