@@ -4,6 +4,10 @@
 
 > **聲明**：RenderFilm Batch 是非官方的個人專案，與 Kodak、Fujifilm 及任何相機或底片廠商皆無關聯、未獲認可。底片風格是以學習與參考為目的的近似詮釋，提到的品牌名稱為各自所有者的商標。
 
+## 下載
+
+到 [Releases](../../releases) 下載 `RenderFilmBatch-<版本>.zip`，解壓後拖進「應用程式」。App 已用 Developer ID 簽名並通過 Apple 公證，雙擊即可開啟。
+
 ## 環境需求
 
 - macOS 14 以上、Apple Silicon。
@@ -15,6 +19,16 @@
 ./Scripts/make-batch-app.sh      # 產生 build/RenderFilmBatch.app
 open build/RenderFilmBatch.app
 ```
+
+### 簽名與公證（選用）
+
+```bash
+SIGN_IDENTITY="Developer ID Application: <名稱> (<Team ID>)" \
+NOTARY_PROFILE=<notarytool 設定檔> ./Scripts/make-batch-app.sh
+```
+
+- 沒設 `SIGN_IDENTITY` 就只打包、不簽名。
+- `NOTARY_PROFILE` 先用 `xcrun notarytool store-credentials` 建立；有設才送公證並釘上公證票。
 
 ## 流程
 

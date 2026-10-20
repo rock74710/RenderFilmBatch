@@ -43,4 +43,21 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# 簽名：設定 SIGN_IDENTITY 才簽；有設 NOTARY_PROFILE 再送公證。
+# 例：SIGN_IDENTITY="Developer ID Application: ..." NOTARY_PROFILE=RF-notary ./Scripts/make-batch-app.sh
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+    codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+    codesign --verify --strict --verbose=2 "$APP"
+    if [ -n "${NOTARY_PROFILE:-}" ]; then
+        ZIP="$ROOT/build/RenderFilmBatch.zip"
+        ditto -c -k --keepParent "$APP" "$ZIP"
+        xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+        xcrun stapler staple "$APP"
+        rm -f "$ZIP"
+        spctl -a -vv "$APP"
+    fi
+else
+    echo "未設定 SIGN_IDENTITY，略過簽名"
+fi
+
 echo "已產生 $APP"
