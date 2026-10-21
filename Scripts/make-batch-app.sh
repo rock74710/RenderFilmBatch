@@ -23,6 +23,16 @@ cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/"
 # 介面字串以中文為 key；其他語系放在 Localization/<target>/<lang>.lproj。
 cp -R "$ROOT/Localization/RenderFilmBatch/"*.lproj "$APP/Contents/Resources/"
 
+# App 圖示：AppIcon.appiconset 的 -2x 檔名改成 iconutil 要的 @2x 再轉成 icns。
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+mkdir -p "$ICONSET"
+for png in "$ROOT/AppIcon.appiconset/"*.png; do
+    name="$(basename "$png")"
+    cp "$png" "$ICONSET/${name/-2x/@2x}"
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+rm -rf "$(dirname "$ICONSET")"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,9 +44,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key><string>RenderFilmBatch</string>
     <key>CFBundleDevelopmentRegion</key><string>zh-Hant</string>
     <key>CFBundleLocalizations</key><array><string>zh-Hant</string><string>en</string></array>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>0.1.1</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
