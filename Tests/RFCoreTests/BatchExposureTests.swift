@@ -201,6 +201,82 @@ final class BatchExposureTests: XCTestCase {
         XCTAssertEqual(prepared.parameters.layerA.exposureEV, 0.35, accuracy: 0.0001)
     }
 
+    func testReusedSourceAnalysesMatchFreshRawAndProcessedCandidatePreparation() async throws {
+        guard let gpu = GPUContext.shared else { throw XCTSkip("GPU unavailable") }
+        let pipeline = try RenderPipeline(gpu: gpu)
+        let exporter = BatchExporter(pipeline: pipeline)
+        let extent = CGRect(x: 0, y: 0, width: 96, height: 64)
+        let sky = CIImage(color: CIColor(red: 0.45, green: 0.62, blue: 0.82))
+            .cropped(to: CGRect(x: 0, y: 32, width: 96, height: 32))
+        let foreground = CIImage(color: CIColor(red: 0.2, green: 0.28, blue: 0.12))
+            .cropped(to: CGRect(x: 0, y: 0, width: 96, height: 32))
+        let sourceImage = foreground.composited(over: sky).cropped(to: extent)
+        let raw = DecodedRaw(url: URL(fileURLWithPath: "/synthetic-match.dng"), image: sourceImage,
+                             metadata: RawMetadata(), fullSize: extent.size,
+                             colorSpace: gpu.workingColorSpace)
+        let processedInfo = ProcessedImageInfo(format: .jpeg, width: 96, height: 64,
+                                               sourceOrientation: 1, sourceTypeIdentifier: "public.jpeg",
+                                               colorProfileName: nil, colorSpaceFallback: true)
+        let processed = DecodedProcessedImage(
+            url: URL(fileURLWithPath: "/synthetic-match.jpg"), image: sourceImage,
+            metadata: RawMetadata(),
+            colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearITUR_2020)!,
+            info: processedInfo)
+
+        var settings = BatchExportSettings()
+        settings.automaticExposure = true
+        settings.sceneAwareExposure = true
+        settings.automaticStraighten = true
+        settings.automaticColor = true
+        settings.whiteBalance = .automatic
+        let rawAnalyses = try await exporter.reusableExposureMatchAnalyses(
+            source: .raw(raw), settings: settings)
+        let processedAnalyses = try await exporter.reusableExposureMatchAnalyses(
+            source: .processed(processed), settings: settings)
+        XCTAssertNotNil(rawAnalyses.meteringMap)
+        XCTAssertNotNil(processedAnalyses.meteringMap)
+        XCTAssertNotNil(rawAnalyses.autoWhiteBalance)
+        XCTAssertNotNil(processedAnalyses.autoWhiteBalance)
+        XCTAssertNotNil(rawAnalyses.straightenDegrees)
+        XCTAssertNotNil(processedAnalyses.straightenDegrees)
+
+        let processedRenderer = try ProcessedImageRenderer(gpu: gpu)
+        for exposureEV in [-0.8, 0.9] {
+            settings.absoluteExposureEV = exposureEV
+            let freshRaw = try await exporter.prepare(decoded: raw, settings: settings, exposureEV: nil)
+            let reusedRaw = try await exporter.prepare(decoded: raw, settings: settings, exposureEV: nil,
+                                                       reusableAnalyses: rawAnalyses)
+            XCTAssertEqual(freshRaw.parameters.layerA.exposureEV, exposureEV, accuracy: 0.0001)
+            XCTAssertEqual(reusedRaw.parameters.layerA.exposureEV, exposureEV, accuracy: 0.0001)
+            let freshRawImage = try pipeline.render(sceneMaster: freshRaw.master,
+                                                    parameters: freshRaw.parameters,
+                                                    target: .preset(.appleSDR))
+            let reusedRawImage = try pipeline.render(sceneMaster: reusedRaw.master,
+                                                     parameters: reusedRaw.parameters,
+                                                     target: .preset(.appleSDR))
+            XCTAssertLessThanOrEqual(try maximumChannelDelta(freshRawImage, reusedRawImage,
+                                                             context: gpu.ciContext), 1,
+                                     "source-only raw analyses must preserve each EV candidate's pixels")
+
+            let freshProcessed = try await exporter.prepareProcessed(
+                decoded: processed, settings: settings, exposureEV: nil)
+            let reusedProcessed = try await exporter.prepareProcessed(
+                decoded: processed, settings: settings, exposureEV: nil,
+                reusableAnalyses: processedAnalyses)
+            XCTAssertEqual(freshProcessed.exposureEV, exposureEV, accuracy: 0.0001)
+            XCTAssertEqual(reusedProcessed.exposureEV, exposureEV, accuracy: 0.0001)
+            let freshProcessedImage = try processedRenderer.render(
+                source: freshProcessed.source, parameters: freshProcessed.parameters,
+                target: .preset(.appleSDR), autoWhiteBalanceGains: freshProcessed.autoWhiteBalanceGains)
+            let reusedProcessedImage = try processedRenderer.render(
+                source: reusedProcessed.source, parameters: reusedProcessed.parameters,
+                target: .preset(.appleSDR), autoWhiteBalanceGains: reusedProcessed.autoWhiteBalanceGains)
+            XCTAssertLessThanOrEqual(try maximumChannelDelta(freshProcessedImage, reusedProcessedImage,
+                                                             context: gpu.ciContext), 1,
+                                     "source-only processed analyses must preserve each EV candidate's pixels")
+        }
+    }
+
     func testProcessedExportUsesExplicitExposureWhenAutomaticIsOff() async throws {
         guard let gpu = GPUContext.shared else { throw XCTSkip("GPU unavailable") }
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString,
@@ -315,6 +391,32 @@ final class BatchExposureTests: XCTestCase {
         settings.film.select(.classicCinema)
         settings.curve.rgb = [0, 0.18, 0.42, 0.73, 1]
         return settings
+    }
+
+    private func maximumChannelDelta(_ lhs: CIImage, _ rhs: CIImage, context: CIContext) throws -> Int {
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let left = try XCTUnwrap(context.createCGImage(lhs, from: lhs.extent.integral,
+                                                       format: .RGBA8, colorSpace: colorSpace))
+        let right = try XCTUnwrap(context.createCGImage(rhs, from: rhs.extent.integral,
+                                                        format: .RGBA8, colorSpace: colorSpace))
+        guard left.width == right.width, left.height == right.height else {
+            XCTFail("rendered candidate dimensions must match")
+            return Int.max
+        }
+        let leftBytes = try XCTUnwrap(left.dataProvider?.data as Data?)
+        let rightBytes = try XCTUnwrap(right.dataProvider?.data as Data?)
+        var maximum = 0
+        for y in 0..<left.height {
+            for x in 0..<left.width {
+                let leftOffset = y * left.bytesPerRow + x * 4
+                let rightOffset = y * right.bytesPerRow + x * 4
+                for channel in 0..<3 {
+                    maximum = max(maximum, abs(Int(leftBytes[leftOffset + channel])
+                                           - Int(rightBytes[rightOffset + channel])))
+                }
+            }
+        }
+        return maximum
     }
 
     private func writeSolidImage(to url: URL, type: UTType, value: Double) throws {

@@ -102,7 +102,7 @@ final class BatchModel: ObservableObject {
             guard previewFile != oldValue else { return }
             invalidateExposureMatchSnapshot()
             // 換來源就停掉舊工作並清空，避免慢的舊預覽蓋掉新照片或殘留在空資料夾。
-            previewTask?.cancel()
+            cancelPreviewWork()
             previewImage = nil
             previewStatus = ""
         }
@@ -128,7 +128,8 @@ final class BatchModel: ObservableObject {
 
     private var runTask: Task<Void, Never>?
     private var exposureMatchTask: Task<Void, Never>?
-    private var previewTask: Task<Void, Never>?
+    private let previewQueue = LatestOnlyBatchPreviewQueue()
+    private var previewGeneration: UInt64 = 0
     private var previewExporter: BatchExporter?
     private var thumbnailTask: Task<Void, Never>?
     private var subscriptions: Set<AnyCancellable> = []
@@ -452,30 +453,65 @@ final class BatchModel: ObservableObject {
     }
 
     func refreshPreview() {
-        previewTask?.cancel()
-        guard !isRunning, !isMatchingExposure, let file = previewFile, let base = makeSettings() else { return }
+        previewGeneration &+= 1
+        let generation = previewGeneration
+        guard !isRunning, !isMatchingExposure, let file = previewFile, let base = makeSettings() else {
+            Task { await previewQueue.cancel(generation: generation) }
+            return
+        }
         let settings = self.settings(base, for: file)
         previewStatus = String(localized: "產生預覽中…")
-        previewTask = Task {
-            do {
-                if previewExporter == nil { previewExporter = try makeExporter() }
-                let exporter = previewExporter!
-                let preview = try await Task.detached(priority: .userInitiated) {
-                    try await exporter.preview(rawURL: file, settings: settings, maxDimension: 1200)
-                }.value
-                guard !Task.isCancelled else { return }
-                previewImage = preview.image
-                let result = preview.result
-                var text = String(format: "EV %+.2f", result.appliedExposureEV)
-                if result.appliedSkyEV != 0 { text += String(format: String(localized: "，天空 %+.2f"), result.appliedSkyEV) }
-                if settings.isHDR { text += String(localized: "（預覽以 SDR 顯示）") }
-                previewStatus = text
-            } catch {
-                guard !Task.isCancelled else { return }
-                previewImage = nil
-                previewStatus = String(localized: "預覽失敗：\(error)")
+        do {
+            if previewExporter == nil { previewExporter = try makeExporter() }
+        } catch {
+            previewImage = nil
+            previewStatus = String(localized: "預覽失敗：") + String(describing: error)
+            Task { await previewQueue.cancel(generation: generation) }
+            return
+        }
+        let exporter = previewExporter!
+        let queue = previewQueue
+        Task { [weak self] in
+            await queue.submit(generation: generation) { [weak self] in
+                do {
+                    try Task<Never, Never>.checkCancellation()
+                    let renderTask = Task.detached(priority: .userInitiated) {
+                        try await exporter.preview(rawURL: file, settings: settings, maxDimension: 1200)
+                    }
+                    let preview = try await withTaskCancellationHandler {
+                        try await renderTask.value
+                    } onCancel: {
+                        renderTask.cancel()
+                    }
+                    try Task<Never, Never>.checkCancellation()
+                    await MainActor.run {
+                        guard let self, self.previewGeneration == generation else { return }
+                        self.previewImage = preview.image
+                        let result = preview.result
+                        var text = String(format: "EV %+.2f", result.appliedExposureEV)
+                        if result.appliedSkyEV != 0 {
+                            text += String(format: String(localized: "，天空 %+.2f"), result.appliedSkyEV)
+                        }
+                        if settings.isHDR { text += String(localized: "（預覽以 SDR 顯示）") }
+                        self.previewStatus = text
+                    }
+                } catch {
+                    guard !Task<Never, Never>.isCancelled else { return }
+                    await MainActor.run {
+                        guard let self, self.previewGeneration == generation else { return }
+                        self.previewImage = nil
+                        self.previewStatus = String(localized: "預覽失敗：") + String(describing: error)
+                    }
+                }
             }
         }
+    }
+
+    private func cancelPreviewWork() {
+        previewExporter?.releasePreviewSources()
+        previewGeneration &+= 1
+        let generation = previewGeneration
+        Task { await previewQueue.cancel(generation: generation) }
     }
 
     // MARK: 批次
@@ -525,7 +561,7 @@ final class BatchModel: ObservableObject {
             return
         }
 
-        previewTask?.cancel()
+        cancelPreviewWork()
         exposureMatchRevision &+= 1
         let revision = exposureMatchRevision
         isMatchingExposure = true
@@ -659,7 +695,7 @@ final class BatchModel: ObservableObject {
             return
         }
 
-        previewTask?.cancel()
+        cancelPreviewWork()
         completed = 0
         total = files.count
         rows = []

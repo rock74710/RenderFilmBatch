@@ -42,6 +42,58 @@ final class BatchProcessedImageTests: XCTestCase {
                              "profile, film, and curve settings should change the processed preview")
     }
 
+    func testNeutralLargeJPEGPreviewMatchesFullSourceOrientationAndColor() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("large-rotated.jpg")
+        try writeImage(to: input, type: .jpeg, orientation: 6, width: 640, height: 480)
+
+        let gpu = try XCTUnwrap(GPUContext.shared)
+        let pipeline = try RenderPipeline(gpu: gpu)
+        let preview = try await BatchExporter(pipeline: pipeline).preview(
+            rawURL: input, settings: BatchExportSettings(), maxDimension: 120)
+        XCTAssertEqual(preview.image.width, 90)
+        XCTAssertEqual(preview.image.height, 120)
+
+        let decoded = try ProcessedImageDecoder().decode(url: input, context: gpu.ciContext)
+        let expected = try ProcessedImageRenderer(gpu: gpu).render(
+            source: decoded, parameters: ProcessedImageRenderer.defaults(),
+            target: .preset(.appleSDR), maxDimension: 120)
+        let expectedCG = try XCTUnwrap(gpu.ciContext.createCGImage(
+            expected, from: expected.extent, format: .RGBA8,
+            colorSpace: RenderPipeline.colorSpace(for: .preset(.appleSDR))))
+        XCTAssertLessThanOrEqual(try maximumChannelDelta(preview.image, expectedCG), 1,
+                                 "neutral preview must preserve the full-source orientation and pixels")
+    }
+
+    func testConcurrentBatchPreviewsKeepEachProcessedStyleOutput() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("concurrent.jpg")
+        try writeImage(to: input, type: .jpeg, width: 320, height: 240)
+        let gpu = try XCTUnwrap(GPUContext.shared)
+        let exporter = BatchExporter(pipeline: try RenderPipeline(gpu: gpu))
+        var warm = BatchExportSettings()
+        warm.profile = .chromeLike
+        warm.film.select(.cinema)
+        var cool = BatchExportSettings()
+        cool.profile = .natural
+        cool.curve.rgb = [0, 0.2, 0.5, 0.8, 1]
+
+        async let warmPreview = exporter.preview(rawURL: input, settings: warm, maxDimension: 120)
+        async let coolPreview = exporter.preview(rawURL: input, settings: cool, maxDimension: 120)
+        let (concurrentWarm, concurrentCool) = try await (warmPreview, coolPreview)
+        let serialWarm = try await exporter.preview(rawURL: input, settings: warm, maxDimension: 120)
+        let serialCool = try await exporter.preview(rawURL: input, settings: cool, maxDimension: 120)
+
+        XCTAssertLessThanOrEqual(try maximumChannelDelta(concurrentWarm.image, serialWarm.image), 0,
+                                 "concurrent rendering must not mix the warm style into another request")
+        XCTAssertLessThanOrEqual(try maximumChannelDelta(concurrentCool.image, serialCool.image), 0,
+                                 "concurrent rendering must not mix the curve from another request")
+        XCTAssertGreaterThan(try maximumChannelDelta(serialWarm.image, serialCool.image), 2,
+                             "the reference styles should produce distinguishable pixels")
+    }
+
     func testJPEGExportUsesProcessedSettingsAndNormalizesOrientation() async throws {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -216,9 +268,8 @@ final class BatchProcessedImageTests: XCTestCase {
         return url
     }
 
-    private func writeImage(to url: URL, type: UTType, orientation: Int = 1) throws {
-        let width = 64
-        let height = 48
+    private func writeImage(to url: URL, type: UTType, orientation: Int = 1,
+                            width: Int = 64, height: Int = 48) throws {
         var bytes = [UInt8](repeating: 0, count: width * height * 4)
         for y in 0..<height {
             for x in 0..<width {

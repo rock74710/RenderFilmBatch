@@ -276,12 +276,37 @@ public enum BatchExportError: Error, CustomStringConvertible {
     }
 }
 
+private final class ReusableProcessedRenderer: @unchecked Sendable {
+    private let gpu: GPUContext
+    private let lock = NSLock()
+    private var renderer: ProcessedImageRenderer?
+
+    init(gpu: GPUContext) { self.gpu = gpu }
+
+    func render(source: DecodedProcessedImage, parameters: EditParameters,
+                target: RenderingTarget, maxDimension: Int? = nil,
+                autoWhiteBalanceGains: SIMD3<Double>? = nil) throws -> CIImage {
+        try Task<Never, Never>.checkCancellation()
+        lock.lock()
+        defer { lock.unlock() }
+        try Task<Never, Never>.checkCancellation()
+        if renderer == nil { renderer = try ProcessedImageRenderer(gpu: gpu) }
+        let image = try renderer!.render(source: source, parameters: parameters, target: target,
+                                         maxDimension: maxDimension,
+                                         autoWhiteBalanceGains: autoWhiteBalanceGains)
+        try Task<Never, Never>.checkCancellation()
+        return image
+    }
+}
+
 /// One-file batch operation. The UI owns folder enumeration, progress and cancellation.
 public struct BatchExporter: Sendable {
     public let pipeline: RenderPipeline
     public let exporter: Exporter
+    private let processedRenderer: ReusableProcessedRenderer
+    private let previewSourceCache = BatchPreviewSourceCache()
 
-    private enum ExposureSource {
+    enum ExposureSource {
         case raw(DecodedRaw)
         case processed(DecodedProcessedImage)
     }
@@ -289,6 +314,11 @@ public struct BatchExporter: Sendable {
     public init(pipeline: RenderPipeline) {
         self.pipeline = pipeline
         self.exporter = Exporter(gpu: pipeline.gpu)
+        self.processedRenderer = ReusableProcessedRenderer(gpu: pipeline.gpu)
+    }
+
+    public func releasePreviewSources() {
+        previewSourceCache.removeAll()
     }
 
     /// Input types accepted by the batch app. Processed photos always use the SDR Image I/O path.
@@ -308,7 +338,7 @@ public struct BatchExporter: Sendable {
         var neuralNoiseReduction: Bool
     }
 
-    private struct PreparedProcessed {
+    struct PreparedProcessed {
         var source: DecodedProcessedImage
         var parameters: EditParameters
         var exposureEV: Double
@@ -318,6 +348,13 @@ public struct BatchExporter: Sendable {
         var whiteBalanceFallback: Bool
         var automaticColorApplied: Bool
         var straightenDegrees: Double
+    }
+
+    struct ExposureMatchAnalyses {
+        var meteringMap: ExposureMetering.Map?
+        var skyMedian: Double?
+        var autoWhiteBalance: AutoWhiteBalance.Result?
+        var straightenDegrees: Double?
     }
 
     /// 只做自動 EV 分析（EV 平滑的第一輪）。已有匹配 override 時不再分析或平滑。
@@ -347,7 +384,8 @@ public struct BatchExporter: Sendable {
     /// absolute override 仍可做場景天空修正，但不會被 auto 或 smooth 替換。
     /// `maxDimension` 給預覽用，在測光之後才縮圖。
     func prepare(decoded: DecodedRaw, settings: BatchExportSettings, exposureEV: Double?,
-                 maxDimension: Int? = nil) async throws -> Prepared {
+                 maxDimension: Int? = nil,
+                 reusableAnalyses: ExposureMatchAnalyses? = nil) async throws -> Prepared {
         var parameters = EditParameters()
         parameters.applyProfile(settings.profile)
         parameters.film = settings.film
@@ -364,7 +402,13 @@ public struct BatchExporter: Sendable {
             if settings.absoluteExposureEV == nil {
                 global = await globalExposure(decoded.image, settings: settings)
             } else if settings.sceneAwareExposure {
-                global = (0, await ExposureMetering.map(for: decoded.image, context: context))
+                let map: ExposureMetering.Map
+                if let reused = reusableAnalyses?.meteringMap {
+                    map = reused
+                } else {
+                    map = await ExposureMetering.map(for: decoded.image, context: context)
+                }
+                global = (0, map)
             } else {
                 global = (0, nil)
             }
@@ -375,8 +419,15 @@ public struct BatchExporter: Sendable {
             parameters.layerA.exposureEV = ev
             if let map = global.map {
                 meteringSources = map.sources
-                if let mask = map.sky,
-                   let skyMedian = AutoExposure.analyze(decoded.image, context: context, weights: mask).medianLuminance {
+                let skyMedian: Double?
+                if let reusableAnalyses {
+                    skyMedian = reusableAnalyses.skyMedian
+                } else if let mask = map.sky {
+                    skyMedian = AutoExposure.analyze(decoded.image, context: context, weights: mask).medianLuminance
+                } else {
+                    skyMedian = nil
+                }
+                if let mask = map.sky, let skyMedian {
                     let skyEV = AutoExposure.skyEV(skyMedian: skyMedian, globalEV: ev)
                     if skyEV != 0 { sky = (mask, skyEV) }
                 }
@@ -394,7 +445,8 @@ public struct BatchExporter: Sendable {
         case .camera:
             break
         case .automatic:
-            let result = AutoWhiteBalance.analyze(decoded.image, context: context)
+            let result = reusableAnalyses?.autoWhiteBalance
+                ?? pipeline.cachedAutoWhiteBalance(decoded: decoded)
             autoWhiteBalanceGains = result.gains
             whiteBalanceFallback = result.usedFallback
         case .preset(let preset):
@@ -432,8 +484,8 @@ public struct BatchExporter: Sendable {
                 lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
         }
         // 角度在全解析度上偵測，proxy 與正式輸出才會旋轉同樣的角度；天空遮罩已先套好。
-        let straighten = settings.automaticStraighten
-            ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0
+        let straighten = reusableAnalyses?.straightenDegrees
+            ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
         if straighten != 0 {
             sceneLinear = SceneLinearImage(
                 image: AutoStraighten.apply(straighten, to: sceneLinear.image),
@@ -465,8 +517,9 @@ public struct BatchExporter: Sendable {
                             && decoded.metadata.decoderVersion.map { $0.hasPrefix("9") } == true)
     }
 
-    private func prepareProcessed(decoded: DecodedProcessedImage, settings: BatchExportSettings,
-                                  exposureEV: Double?) async throws -> PreparedProcessed {
+    func prepareProcessed(decoded: DecodedProcessedImage, settings: BatchExportSettings,
+                          exposureEV: Double?,
+                          reusableAnalyses: ExposureMatchAnalyses? = nil) async throws -> PreparedProcessed {
         var parameters = ProcessedImageRenderer.defaults()
         if settings.profile != .natural {
             parameters.applyProfile(settings.profile)
@@ -489,7 +542,13 @@ public struct BatchExporter: Sendable {
             if settings.absoluteExposureEV == nil {
                 global = await globalExposure(decoded.image, settings: settings)
             } else if settings.sceneAwareExposure {
-                global = (0, await ExposureMetering.map(for: decoded.image, context: context))
+                let map: ExposureMetering.Map
+                if let reused = reusableAnalyses?.meteringMap {
+                    map = reused
+                } else {
+                    map = await ExposureMetering.map(for: decoded.image, context: context)
+                }
+                global = (0, map)
             } else {
                 global = (0, nil)
             }
@@ -501,9 +560,16 @@ public struct BatchExporter: Sendable {
             parameters.layerA.exposureEV = analyzedExposureEV
             if let map = global.map {
                 meteringSources = map.sources
-                if let mask = map.sky,
-                   let skyMedian = AutoExposure.analyze(decoded.image, context: context,
-                                                        weights: mask).medianLuminance {
+                let skyMedian: Double?
+                if let reusableAnalyses {
+                    skyMedian = reusableAnalyses.skyMedian
+                } else if let mask = map.sky {
+                    skyMedian = AutoExposure.analyze(decoded.image, context: context,
+                                                     weights: mask).medianLuminance
+                } else {
+                    skyMedian = nil
+                }
+                if let mask = map.sky, let skyMedian {
                     skyEV = AutoExposure.skyEV(skyMedian: skyMedian, globalEV: analyzedExposureEV)
                     if skyEV != 0 {
                         sourceImage = AutoExposure.applyRegionalEV(skyEV, mask: mask, to: sourceImage)
@@ -527,7 +593,8 @@ public struct BatchExporter: Sendable {
             break
         case .automatic, .preset(.auto):
             parameters.layerA.whiteBalance.select(.auto)
-            let result = AutoWhiteBalance.analyze(decoded.image, context: context)
+            let result = reusableAnalyses?.autoWhiteBalance
+                ?? AutoWhiteBalance.analyze(decoded.image, context: context)
             autoWhiteBalanceGains = result.gains
             whiteBalanceFallback = result.usedFallback
         case .preset(let preset):
@@ -558,8 +625,8 @@ public struct BatchExporter: Sendable {
             sourceWasTransformed = true
         }
 
-        let straighten = settings.automaticStraighten
-            ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0
+        let straighten = reusableAnalyses?.straightenDegrees
+            ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
         if straighten != 0 {
             sourceImage = AutoStraighten.apply(straighten, to: sourceImage)
             sourceWasTransformed = true
@@ -618,6 +685,53 @@ public struct BatchExporter: Sendable {
                           straightenDegrees: prepared.straightenDegrees)
     }
 
+    func reusableExposureMatchAnalyses(
+        source: ExposureSource, settings: BatchExportSettings
+    ) async throws -> ExposureMatchAnalyses {
+        let image: CIImage
+        switch source {
+        case .raw(let decoded): image = decoded.image
+        case .processed(let decoded): image = decoded.image
+        }
+
+        var meteringMap: ExposureMetering.Map?
+        var skyMedian: Double?
+        if settings.automaticExposure && settings.sceneAwareExposure {
+            let map = await ExposureMetering.map(for: image, context: pipeline.gpu.ciContext)
+            meteringMap = map
+            if let sky = map.sky {
+                skyMedian = AutoExposure.analyze(image, context: pipeline.gpu.ciContext,
+                                                 weights: sky).medianLuminance
+            }
+        }
+
+        let needsAutoWhiteBalance: Bool
+        switch (source, settings.whiteBalance) {
+        case (.raw(_), .automatic), (.processed(_), .automatic), (.processed(_), .preset(.auto)):
+            needsAutoWhiteBalance = true
+        default:
+            needsAutoWhiteBalance = false
+        }
+        let autoWhiteBalance: AutoWhiteBalance.Result?
+        if needsAutoWhiteBalance {
+            switch source {
+            case .raw(let decoded):
+                autoWhiteBalance = pipeline.cachedAutoWhiteBalance(decoded: decoded)
+            case .processed:
+                autoWhiteBalance = AutoWhiteBalance.analyze(image, context: pipeline.gpu.ciContext)
+            }
+        } else {
+            autoWhiteBalance = nil
+        }
+
+        let straightenDegrees = settings.automaticStraighten
+            ? AutoStraighten.detect(image, context: pipeline.gpu.ciContext) ?? 0 : nil
+        try Task.checkCancellation()
+        return ExposureMatchAnalyses(meteringMap: meteringMap, skyMedian: skyMedian,
+                                     autoWhiteBalance: autoWhiteBalance,
+                                     straightenDegrees: straightenDegrees)
+    }
+
     private func decodeForExposureMatch(_ url: URL, settings: BatchExportSettings) throws -> ExposureSource {
         if ProcessedImageDecoder.isSupported(url) {
             return .processed(try ProcessedImageDecoder().decode(url: url, context: pipeline.gpu.ciContext))
@@ -627,19 +741,22 @@ public struct BatchExporter: Sendable {
 
     /// 使用固定的 512px SDR 預覽座標，避免曝光搜尋反覆完整解 RAW。
     private func renderExposurePreview(source: ExposureSource, settings: BatchExportSettings,
-                                       maxDimension: Int) async throws -> CIImage {
+                                       maxDimension: Int,
+                                       reusableAnalyses: ExposureMatchAnalyses? = nil) async throws -> CIImage {
         try Task.checkCancellation()
         switch source {
         case .raw(let decoded):
             let prepared = try await prepare(decoded: decoded, settings: settings,
-                                             exposureEV: nil, maxDimension: maxDimension)
+                                             exposureEV: nil, maxDimension: maxDimension,
+                                             reusableAnalyses: reusableAnalyses)
             try Task.checkCancellation()
             return try pipeline.render(sceneMaster: prepared.master, parameters: prepared.parameters,
                                        target: RenderingTarget.preset(.appleSDR))
         case .processed(let decoded):
-            let prepared = try await prepareProcessed(decoded: decoded, settings: settings, exposureEV: nil)
+            let prepared = try await prepareProcessed(decoded: decoded, settings: settings, exposureEV: nil,
+                                                       reusableAnalyses: reusableAnalyses)
             try Task.checkCancellation()
-            return try ProcessedImageRenderer(gpu: pipeline.gpu).render(
+            return try processedRenderer.render(
                 source: prepared.source, parameters: prepared.parameters,
                 target: RenderingTarget.preset(.appleSDR), maxDimension: maxDimension,
                 autoWhiteBalanceGains: prepared.autoWhiteBalanceGains)
@@ -662,6 +779,7 @@ public struct BatchExporter: Sendable {
                               targets: [BatchExposureMatchTarget], maxDimension: Int = 512,
                               progress: @Sendable (Int, Int) -> Void = { _, _ in }) async throws
         -> BatchExposureMatchReport {
+        previewSourceCache.removeAll()
         try Task.checkCancellation()
         let referenceSource = try decodeForExposureMatch(referenceURL, settings: referenceSettings)
         let referenceImage = try await renderExposurePreview(source: referenceSource,
@@ -698,6 +816,8 @@ public struct BatchExporter: Sendable {
             }
             do {
                 let source = try decodeForExposureMatch(target.photo, settings: target.settings)
+                let reusableAnalyses = try await reusableExposureMatchAnalyses(
+                    source: source, settings: target.settings)
                 var cachedWeights: CIImage?
                 var cachedSources: [String] = []
                 let search = try await BatchExposureMatching.search(
@@ -708,7 +828,8 @@ public struct BatchExporter: Sendable {
                     candidate.absoluteExposureEV = totalEV - candidate.exposureCompensationEV
                     let image = try await self.renderExposurePreview(source: source,
                                                                      settings: candidate,
-                                                                     maxDimension: maxDimension)
+                                                                     maxDimension: maxDimension,
+                                                                     reusableAnalyses: reusableAnalyses)
                     if cachedWeights == nil {
                         let map = await ExposureMetering.map(for: image,
                                                              context: self.pipeline.gpu.ciContext,
@@ -743,15 +864,41 @@ public struct BatchExporter: Sendable {
     /// 用目前設定產生 SDR 縮圖，給批次前預覽。輸出尺寸與超解析度不影響預覽。
     public func preview(rawURL: URL, settings: BatchExportSettings,
                         maxDimension: Int) async throws -> (image: CGImage, result: BatchExportResult) {
-        if ProcessedImageDecoder.isSupported(rawURL) {
-            let decoded = try ProcessedImageDecoder().decode(url: rawURL, context: pipeline.gpu.ciContext)
-            try Task.checkCancellation()
+        let decoded = try previewSourceCache.source(
+            for: rawURL, noiseReduction: settings.noiseReduction
+        ) {
+            if ProcessedImageDecoder.isSupported(rawURL) {
+                return .processed(try ProcessedImageDecoder().decode(url: rawURL,
+                                                                      context: pipeline.gpu.ciContext))
+            }
+            return .raw(try pipeline.decoder.decode(url: rawURL,
+                                                    luminanceNoiseReduction: settings.noiseReduction))
+        }
+        try Task.checkCancellation()
+        switch decoded {
+        case .processed(let imageSource):
+            let decoded = imageSource
             let prepared = try await prepareProcessed(decoded: decoded, settings: settings, exposureEV: nil)
-            let renderer = try ProcessedImageRenderer(gpu: pipeline.gpu)
             let target = RenderingTarget.preset(.appleSDR)
-            let rendered = try renderer.render(source: prepared.source, parameters: prepared.parameters,
-                                               target: target, maxDimension: maxDimension,
-                                               autoWhiteBalanceGains: prepared.autoWhiteBalanceGains)
+            let rendered = try processedRenderer.render(source: prepared.source,
+                                                         parameters: prepared.parameters,
+                                                         target: target, maxDimension: maxDimension,
+                                                         autoWhiteBalanceGains: prepared.autoWhiteBalanceGains)
+            try Task.checkCancellation()
+            guard let image = pipeline.gpu.ciContext.createCGImage(
+                rendered, from: rendered.extent, format: .RGBA8,
+                colorSpace: RenderPipeline.colorSpace(for: target)) else {
+                throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
+            }
+            return (image, result(prepared, outputURL: rawURL, superResolved: false))
+        case .raw(let rawSource):
+            let prepared = try await prepare(decoded: rawSource, settings: settings, exposureEV: nil,
+                                             maxDimension: maxDimension)
+            try Task.checkCancellation()
+            let target = RenderingTarget.preset(.appleSDR)
+            let rendered = try pipeline.render(sceneMaster: prepared.master, parameters: prepared.parameters,
+                                               target: target)
+            try Task.checkCancellation()
             guard let image = pipeline.gpu.ciContext.createCGImage(
                 rendered, from: rendered.extent, format: .RGBA8,
                 colorSpace: RenderPipeline.colorSpace(for: target)) else {
@@ -759,23 +906,12 @@ public struct BatchExporter: Sendable {
             }
             return (image, result(prepared, outputURL: rawURL, superResolved: false))
         }
-        let decoded = try pipeline.decoder.decode(url: rawURL, luminanceNoiseReduction: settings.noiseReduction)
-        let prepared = try await prepare(decoded: decoded, settings: settings, exposureEV: nil,
-                                         maxDimension: maxDimension)
-        let target = RenderingTarget.preset(.appleSDR)
-        let rendered = try pipeline.render(sceneMaster: prepared.master, parameters: prepared.parameters,
-                                           target: target)
-        guard let image = pipeline.gpu.ciContext.createCGImage(
-            rendered, from: rendered.extent, format: .RGBA8,
-            colorSpace: RenderPipeline.colorSpace(for: target)) else {
-            throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
-        }
-        return (image, result(prepared, outputURL: rawURL, superResolved: false))
     }
 
     @discardableResult
     public func process(rawURL: URL, outputURL: URL, settings: BatchExportSettings,
                         exposureEV: Double? = nil) async throws -> BatchExportResult {
+        previewSourceCache.removeAll()
         let files = FileManager.default
         guard !files.fileExists(atPath: outputURL.path) else {
             throw BatchExportError.outputAlreadyExists(outputURL)
@@ -783,13 +919,11 @@ public struct BatchExporter: Sendable {
         // 取消時在各個耗時步驟之間停下，不等整張做完；暫存檔由下面的 defer 清掉。
         let preparedRaw: Prepared?
         let preparedProcessed: PreparedProcessed?
-        let processedRenderer: ProcessedImageRenderer?
         if ProcessedImageDecoder.isSupported(rawURL) {
             let decoded = try ProcessedImageDecoder().decode(url: rawURL, context: pipeline.gpu.ciContext)
             try Task.checkCancellation()
             preparedProcessed = try await prepareProcessed(decoded: decoded, settings: settings,
                                                            exposureEV: exposureEV)
-            processedRenderer = try ProcessedImageRenderer(gpu: pipeline.gpu)
             preparedRaw = nil
         } else {
             let decoded = try pipeline.decoder.decode(url: rawURL,
@@ -797,7 +931,6 @@ public struct BatchExporter: Sendable {
             try Task.checkCancellation()
             preparedRaw = try await prepare(decoded: decoded, settings: settings, exposureEV: exposureEV)
             preparedProcessed = nil
-            processedRenderer = nil
         }
         try Task.checkCancellation()
         let context = pipeline.gpu.ciContext
@@ -810,10 +943,10 @@ public struct BatchExporter: Sendable {
                                            parameters: preparedRaw.parameters, target: target,
                                            outputColorSpace: outputColorSpace)
             }
-            if let preparedProcessed, let processedRenderer {
-                return try processedRenderer.render(source: preparedProcessed.source,
-                                                    parameters: preparedProcessed.parameters, target: target,
-                                                    autoWhiteBalanceGains: preparedProcessed.autoWhiteBalanceGains)
+            if let preparedProcessed {
+                return try self.processedRenderer.render(source: preparedProcessed.source,
+                                                         parameters: preparedProcessed.parameters, target: target,
+                                                         autoWhiteBalanceGains: preparedProcessed.autoWhiteBalanceGains)
             }
             throw ExportError.encodingFailed(String(localized: "無法啟動圖片渲染器", bundle: .module))
         }
@@ -826,7 +959,7 @@ public struct BatchExporter: Sendable {
             let auxiliaryTarget = Exporter.jpegHDRAuxiliaryTarget(for: settings.target)
             let hdr = try render(auxiliaryTarget, outputColorSpace: pipeline.gpu.workingColorSpace)
             let linearHDR: CIImage
-            if processedRenderer != nil {
+            if preparedProcessed != nil {
                 linearHDR = try linearWorkingImage(hdr, taggedWith: RenderPipeline.colorSpace(for: auxiliaryTarget),
                                                    context: context)
             } else {

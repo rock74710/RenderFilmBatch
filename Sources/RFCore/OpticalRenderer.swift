@@ -39,6 +39,14 @@ public final class OpticalRenderer: @unchecked Sendable {
 
     /// 對 CIImage 套用光學校正。profile 無內容時原樣回傳，不浪費一次 GPU pass。
     public func apply(to image: CIImage, profile: ResolvedLensProfile) throws -> CIImage {
+        try apply(to: image, profile: profile) { width, height in
+            try gpu.makeTexture(width: width, height: height, usage: [.shaderRead, .shaderWrite])
+        }
+    }
+
+    // 注入配置入口，讓測試能核對實際 texture 數量，不把 GPU 記憶體估值當實測。
+    func apply(to image: CIImage, profile: ResolvedLensProfile,
+               allocateTexture: (Int, Int) throws -> MTLTexture) throws -> CIImage {
         guard !profile.isIdentity else { return image }
 
         let extent = image.extent.isInfinite ? CGRect(x: 0, y: 0, width: 2048, height: 2048) : image.extent
@@ -75,9 +83,7 @@ public final class OpticalRenderer: @unchecked Sendable {
         let halfDiag = sqrt(Double(w * w + h * h)) / 2
         params.invHalfDiag = Float(1.0 / halfDiag)
 
-        let source = try gpu.makeTexture(width: w, height: h, usage: [.shaderRead, .shaderWrite])
-        let mid = try gpu.makeTexture(width: w, height: h, usage: [.shaderRead, .shaderWrite])
-        let dest = try gpu.makeTexture(width: w, height: h, usage: [.shaderRead, .shaderWrite])
+        let source = try allocateTexture(w, h)
 
         guard let buffer = gpu.commandQueue.makeCommandBuffer() else { return image }
 
@@ -96,6 +102,7 @@ public final class OpticalRenderer: @unchecked Sendable {
 
         var vignetteInput = source
         if params.vignKind != 0 {
+            let mid = try allocateTexture(w, h)
             guard let enc = buffer.makeComputeCommandEncoder() else { return image }
             enc.setComputePipelineState(vignettePipeline)
             enc.setTexture(source, index: 0)
@@ -108,6 +115,7 @@ public final class OpticalRenderer: @unchecked Sendable {
 
         var output = vignetteInput
         if params.distortionKind != 0 || params.tcaKind != 0 {
+            let dest = try allocateTexture(w, h)
             guard let enc = buffer.makeComputeCommandEncoder() else { return image }
             enc.setComputePipelineState(geometryPipeline)
             enc.setTexture(vignetteInput, index: 0)
