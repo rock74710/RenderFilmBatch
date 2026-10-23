@@ -88,7 +88,7 @@ public struct Exporter: Sendable {
 
         public var isAvailable: Bool {
             if self == .jpegHDR {
-                if #available(macOS 15.0, *) { return true }
+                if #available(iOS 18.0, macOS 15.0, *) { return true }
                 return false
             }
             return true
@@ -119,6 +119,8 @@ public struct Exporter: Sendable {
         quality: Double = 0.9,
         hdrImage: CIImage? = nil
     ) throws {
+        let interval = RFPerformance.begin("Encode")
+        defer { RFPerformance.end("Encode", interval) }
         let colorSpace = RenderPipeline.colorSpace(for: target)
         let options: [CIImageRepresentationOption: Any] =
             [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality]
@@ -186,8 +188,8 @@ public struct Exporter: Sendable {
                 throw ExportError.encodingFailed(String(describing: error))
             }
         case .jpegHDR:
-            guard #available(macOS 15.0, *) else {
-                throw ExportError.unsupportedFormat(String(localized: "JPEG HDR gain map 需要 macOS 15 或更新版本", bundle: .module))
+            guard #available(iOS 18.0, macOS 15.0, *) else {
+                throw ExportError.unsupportedFormat(String(localized: "JPEG HDR gain map 需要 macOS 15 或 iOS 18 或更新版本", bundle: .module))
             }
             guard let hdrImage else {
                 throw ExportError.encodingFailed(String(localized: "JPEG HDR 缺少 HDR auxiliary image", bundle: .module))
@@ -299,47 +301,49 @@ public struct Exporter: Sendable {
         quality: Double = 0.9,
         resize: Resize? = nil
     ) throws -> URL {
-        let target = target ?? parameters.target
-        let master = try pipeline.makeSceneMaster(
-            url: rawURL,
-            parameters: parameters,
-            pinnedDecoderVersion: pinnedDecoderVersion,
-            maxDimension: nil
-        )
-        if format.isSceneLinear {
-            let sceneLinear = try pipeline.renderSceneLinear(
-                sceneMaster: master, parameters: parameters
+        return try autoreleasepool {
+            let target = target ?? parameters.target
+            let master = try pipeline.makeSceneMaster(
+                url: rawURL,
+                parameters: parameters,
+                pinnedDecoderVersion: pinnedDecoderVersion,
+                maxDimension: nil
             )
-            let output = try resize.map { try self.resize(sceneLinear, to: $0) } ?? sceneLinear
-            try write(image: output, to: url, target: .preset(.archive),
-                      format: format, quality: quality)
-        } else if format == .jpegHDR {
-            let sdr = try pipeline.render(
-                sceneMaster: master, parameters: parameters, target: .preset(.appleSDR)
-            )
-            let hdrTarget = Self.jpegHDRAuxiliaryTarget(for: target)
-            let hdr = try pipeline.render(
-                sceneMaster: master, parameters: parameters, target: hdrTarget,
-                outputColorSpace: gpu.workingColorSpace
-            )
-            if let resize {
-                let resizedSDR = try self.resize(sdr, to: resize)
-                let outputSize = resizedSDR.extent.integral.size
-                let resizedHDR = try Self.resize(hdr, toPixelSize: outputSize)
-                try write(image: resizedSDR, to: url, target: target, format: format,
-                          quality: quality, hdrImage: resizedHDR)
+            if format.isSceneLinear {
+                let sceneLinear = try pipeline.renderSceneLinear(
+                    sceneMaster: master, parameters: parameters
+                )
+                let output = try resize.map { try self.resize(sceneLinear, to: $0) } ?? sceneLinear
+                try write(image: output, to: url, target: .preset(.archive),
+                          format: format, quality: quality)
+            } else if format == .jpegHDR {
+                let sdr = try pipeline.render(
+                    sceneMaster: master, parameters: parameters, target: .preset(.appleSDR)
+                )
+                let hdrTarget = Self.jpegHDRAuxiliaryTarget(for: target)
+                let hdr = try pipeline.render(
+                    sceneMaster: master, parameters: parameters, target: hdrTarget,
+                    outputColorSpace: gpu.workingColorSpace
+                )
+                if let resize {
+                    let resizedSDR = try self.resize(sdr, to: resize)
+                    let outputSize = resizedSDR.extent.integral.size
+                    let resizedHDR = try Self.resize(hdr, toPixelSize: outputSize)
+                    try write(image: resizedSDR, to: url, target: target, format: format,
+                              quality: quality, hdrImage: resizedHDR)
+                } else {
+                    try write(image: sdr, to: url, target: target, format: format,
+                              quality: quality, hdrImage: hdr)
+                }
             } else {
-                try write(image: sdr, to: url, target: target, format: format,
-                          quality: quality, hdrImage: hdr)
+                let rendered = try pipeline.render(sceneMaster: master, parameters: parameters,
+                                                   target: target)
+                let output = try resize.map { try self.resize(rendered, to: $0) } ?? rendered
+                try write(image: output, to: url, target: target,
+                          format: format, quality: quality)
             }
-        } else {
-            let rendered = try pipeline.render(sceneMaster: master, parameters: parameters,
-                                               target: target)
-            let output = try resize.map { try self.resize(rendered, to: $0) } ?? rendered
-            try write(image: output, to: url, target: target,
-                      format: format, quality: quality)
+            return url
         }
-        return url
     }
 
     /// High-quality output resampling shared by RAW and already-rendered bridge exports.

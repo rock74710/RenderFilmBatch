@@ -11,6 +11,7 @@ struct LUTParams {
     float shaperLo;    // 以 0.18 中灰為基準的最低 stop
     float shaperHi;    // 最高 stop
     float lutSize;     // 每軸取樣數
+    uint sourceYOffset;
 };
 
 static inline float3 shaper_encode(float3 v, constant LUTParams &p) {
@@ -26,7 +27,8 @@ kernel void rf_apply_lut(
     constant LUTParams &p [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
-    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;
+    uint dstY = gid.y + p.sourceYOffset;
+    if (gid.x >= src.get_width() || gid.y >= src.get_height() || dstY >= dst.get_height()) return;
     constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
 
     float4 c = src.read(gid);
@@ -34,5 +36,5 @@ kernel void rf_apply_lut(
     // 取樣點位於格點中心，先把 [0,1] 映射到 [0.5/N, 1-0.5/N]。
     float3 uvw = (e * (p.lutSize - 1.0f) + 0.5f) / p.lutSize;
     float3 out = lut.sample(s, uvw).rgb;
-    dst.write(float4(out, c.a), gid);
+    dst.write(float4(out, c.a), uint2(gid.x, dstY));
 }

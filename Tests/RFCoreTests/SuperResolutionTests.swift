@@ -3,6 +3,45 @@ import CoreImage
 @testable import RFCore
 
 final class SuperResolutionTests: XCTestCase {
+    func testReturnedImageOwnsPixelStorageAfterUpscaleReturns() throws {
+        guard let gpu = GPUContext.shared else { throw XCTSkip("GPU unavailable") }
+        let image = try autoreleasepool {
+            let source = Self.p2Fixture()
+            XCTAssertEqual(source.extent, CGRect(x: 31, y: -17, width: 225, height: 225))
+            return try SuperResolution.shared().upscale2x(source, context: gpu.ciContext)
+        }
+        XCTAssertEqual(image.extent, CGRect(x: 0, y: 0, width: 450, height: 450))
+
+        var first = [Float16](repeating: 0, count: 450 * 450 * 4)
+        gpu.ciContext.render(image, toBitmap: &first, rowBytes: 450 * 8,
+                             bounds: CGRect(x: 0, y: 0, width: 450, height: 450),
+                             format: .RGBAh, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        var second = [Float16](repeating: 0, count: first.count)
+        gpu.ciContext.render(image, toBitmap: &second, rowBytes: 450 * 8,
+                             bounds: CGRect(x: 0, y: 0, width: 450, height: 450),
+                             format: .RGBAh, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(stride(from: 3, to: first.count, by: 4).allSatisfy { first[$0] == 1 })
+    }
+
+    private static func p2Fixture() -> CIImage {
+        let width = 225, height = 225
+        var values = [Float16](repeating: 1, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                values[offset] = Float16((x * 7 + y * 3) % 251) / 250
+                values[offset + 1] = Float16((x * 5 + y * 11) % 241) / 240
+                values[offset + 2] = Float16((x * 13 + y * 2) % 239) / 238
+            }
+        }
+        let data = values.withUnsafeBufferPointer { Data(buffer: $0) }
+        return CIImage(bitmapData: data, bytesPerRow: width * 8, size: CGSize(width: width, height: height),
+                       format: .RGBAh, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+            .transformed(by: CGAffineTransform(translationX: 31, y: -17))
+    }
+
     /// AC-4: a 1000 px image with long edge 2000 goes through the model; HDR or shrinking stays on Lanczos.
     func testEnlargingUsesModelAndHitsExactTarget() throws {
         guard let gpu = GPUContext.shared else { throw XCTSkip("GPU unavailable") }

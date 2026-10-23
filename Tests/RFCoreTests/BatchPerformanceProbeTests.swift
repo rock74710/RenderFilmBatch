@@ -9,6 +9,49 @@ import XCTest
 
 /// 設定 RF_PERFORMANCE_PROBE=1 啟用；固定照片與像素參考保存在版本控制之外。
 final class BatchPerformanceProbeTests: XCTestCase {
+    /// 改參數的端到端基線；避免把同設定的快取命中當成互動算圖速度。
+    func testChangedExposurePerformanceProbe() async throws {
+        guard ProcessInfo.processInfo.environment["RF_PERFORMANCE_PROBE"] == "1" else {
+            throw XCTSkip("Set RF_PERFORMANCE_PROBE=1 for the changed-exposure probe")
+        }
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("build/qa-rfcore-performance")
+        let gpu = try XCTUnwrap(GPUContext.shared)
+        let exporter = BatchExporter(pipeline: try RenderPipeline(gpu: gpu))
+        print("RF_P0 os=\(ProcessInfo.processInfo.operatingSystemVersionString) gpu=\(gpu.device.name) physicalMemory=\(ProcessInfo.processInfo.physicalMemory)")
+        for ext in ["jpg", "heic"] {
+            let input = root.appendingPathComponent("deterministic-6000x4000.\(ext)")
+            guard FileManager.default.fileExists(atPath: input.path) else {
+                throw XCTSkip("Prepare fixed 24 MP fixtures using testReproduciblePerformanceProbe first")
+            }
+            exporter.releasePreviewSources()
+            _ = try await exporter.preview(rawURL: input, settings: BatchExportSettings(), maxDimension: 1600)
+            var times: [Double] = []
+            var firstTwoDigests: [SHA256.Digest] = []
+            let allocatedBefore = gpu.device.currentAllocatedSize
+            let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
+            for iteration in 0..<30 {
+                var settings = BatchExportSettings()
+                settings.exposureCompensationEV = iteration.isMultiple(of: 2) ? -0.3 : 0.3
+                let start = ContinuousClock.now
+                let output = try await exporter.preview(rawURL: input, settings: settings, maxDimension: 1600)
+                let duration = start.duration(to: .now).components
+                times.append(Double(duration.seconds) + Double(duration.attoseconds) / 1e18)
+                XCTAssertEqual(output.image.width, 1600)
+                XCTAssertEqual(output.image.height, 1067)
+                XCTAssertEqual(output.result.appliedExposureEV, settings.exposureCompensationEV)
+                if iteration < 2 {
+                    let pixels = try XCTUnwrap(output.image.dataProvider?.data)
+                    firstTwoDigests.append(SHA256.hash(data: pixels as Data))
+                }
+            }
+            XCTAssertNotEqual(firstTwoDigests[0], firstTwoDigests[1], "曝光更動必須改變實際預覽像素")
+            let sorted = times.sorted()
+            print("RF_P0 changed-preview-\(ext) count=30 p50=\(sorted[14]) p95=\(sorted[28]) seconds=\(times.map(String.init(describing:)).joined(separator: ","))")
+            print("RF_P0 thermalBefore=\(thermalBefore) thermalAfter=\(ProcessInfo.processInfo.thermalState.rawValue) metalAllocatedBefore=\(allocatedBefore) metalAllocatedAfter=\(gpu.device.currentAllocatedSize) bytes (snapshots, not peak)")
+        }
+    }
+
     func testReproduciblePerformanceProbe() async throws {
         guard ProcessInfo.processInfo.environment["RF_PERFORMANCE_PROBE"] == "1" else {
             throw XCTSkip("Set RF_PERFORMANCE_PROBE=1 for the 24 MP performance probe")

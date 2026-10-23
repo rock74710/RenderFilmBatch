@@ -47,6 +47,8 @@ public final class OpticalRenderer: @unchecked Sendable {
     // 注入配置入口，讓測試能核對實際 texture 數量，不把 GPU 記憶體估值當實測。
     func apply(to image: CIImage, profile: ResolvedLensProfile,
                allocateTexture: (Int, Int) throws -> MTLTexture) throws -> CIImage {
+        let performanceInterval = RFPerformance.begin("OpticalSynchronous")
+        defer { RFPerformance.end("OpticalSynchronous", performanceInterval) }
         guard !profile.isIdentity else { return image }
 
         let extent = image.extent.isInfinite ? CGRect(x: 0, y: 0, width: 2048, height: 2048) : image.extent

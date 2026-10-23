@@ -56,7 +56,7 @@ public enum ExposureMetering {
         add(faces(cgProxy, extent: proxy.extent), weight: weights.face, name: "face")
 
         var sky: CIImage?
-        if detectSky, #available(macOS 27.0, *) {
+        if detectSky, #available(iOS 27.0, macOS 27.0, *) {
             sky = await SkySegmentation.mask(cgProxy)
         }
         if let sky {
@@ -120,7 +120,7 @@ public enum ExposureMetering {
 
 /// macOS 27 iterative segmentation seeded from the top edge. A result only counts as sky when it
 /// is mostly in the upper half and covers a meaningful area; otherwise the frame has no sky layer.
-@available(macOS 27.0, *)
+@available(iOS 27.0, macOS 27.0, *)
 enum SkySegmentation {
     static func mask(_ image: CGImage) async -> CIImage? {
         let request = GenerateIterativeSegmentationRequest(seedPoint: NormalizedPoint(x: 0.5, y: 0.95))

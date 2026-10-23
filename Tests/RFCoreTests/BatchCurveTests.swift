@@ -63,4 +63,27 @@ final class BatchCurveTests: XCTestCase {
         try Data("not xml".utf8).write(to: BatchCurve.url(forRaw: raw))
         XCTAssertThrowsError(try BatchCurve.load(forRaw: raw))
     }
+
+    func testXMLKeepsCDATAAndDirectChildValidationRules() throws {
+        let xml = """
+        <renderfilm-curve version="1" mode="rgb">
+          <curve channel="red">0 0.5 1</curve>
+          <unknown><curve channel="blue">0.2 0.8</curve></unknown>
+          <curve channel="future">not numeric, ignored</curve>
+          <curve channel="green"><![CDATA[0.25 0.75]]></curve>
+        </renderfilm-curve>
+        """
+
+        let curve = try BatchCurve(xml: Data(xml.utf8))
+
+        XCTAssertEqual(curve.mode, .rgb)
+        XCTAssertEqual(curve.red, [0, 0.5, 1])
+        XCTAssertEqual(curve.green, [0.25, 0.75])
+        XCTAssertEqual(curve.blue, [])
+    }
+
+    func testMalformedXMLThrows() {
+        let xml = "<renderfilm-curve mode=\"rgb\"><curve channel=\"red\">0 1</renderfilm-curve>"
+        XCTAssertThrowsError(try BatchCurve(xml: Data(xml.utf8)))
+    }
 }

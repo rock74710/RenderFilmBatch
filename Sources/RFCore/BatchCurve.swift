@@ -56,6 +56,7 @@ public struct BatchCurve: Equatable, Sendable {
     }
 
     public init(xml data: Data) throws {
+#if os(macOS)
         let root = try XMLDocument(data: data).rootElement()
         guard let root, root.name == "renderfilm-curve",
               let mode = root.attribute(forName: "mode")?.stringValue.flatMap(Mode.init) else {
@@ -69,9 +70,24 @@ public struct BatchCurve: Equatable, Sendable {
             guard values.allSatisfy({ $0 != nil }) else { throw CocoaError(.fileReadCorruptFile) }
             self[keyPath: path] = values.compactMap { $0 }
         }
+#else
+        let parsed = try BatchCurveXMLReader.parse(data)
+        guard parsed.rootName == "renderfilm-curve",
+              let mode = parsed.rootAttributes?["mode"].flatMap(Mode.init) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.mode = mode
+        for (name, text) in parsed.curves {
+            guard let path = Self.channels.first(where: { $0.name == name })?.path else { continue }
+            let values = text.split(separator: " ").map { Double($0) }
+            guard values.allSatisfy({ $0 != nil }) else { throw CocoaError(.fileReadCorruptFile) }
+            self[keyPath: path] = values.compactMap { $0 }
+        }
+#endif
     }
 
     public func xmlData() -> Data {
+#if os(macOS)
         let root = XMLElement(name: "renderfilm-curve")
         root.addAttribute(XMLNode.attribute(withName: "version", stringValue: "1") as! XMLNode)
         root.addAttribute(XMLNode.attribute(withName: "mode", stringValue: mode.rawValue) as! XMLNode)
@@ -84,5 +100,77 @@ public struct BatchCurve: Equatable, Sendable {
         document.version = "1.0"
         document.characterEncoding = "UTF-8"
         return document.xmlData(options: .nodePrettyPrint)
+#else
+        var lines = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<renderfilm-curve version=\"1\" mode=\"\(mode.rawValue)\">",
+        ]
+        for (name, path) in Self.channels where !self[keyPath: path].isEmpty {
+            let values = self[keyPath: path].map { "\($0)" }.joined(separator: " ")
+            lines.append("  <curve channel=\"\(name)\">\(values)</curve>")
+        }
+        lines.append("</renderfilm-curve>")
+        return Data((lines.joined(separator: "\n") + "\n").utf8)
+#endif
     }
 }
+
+#if os(iOS)
+/// iOS 沒有 `XMLDocument`／`XMLElement`；XMLParser 仍採用相同的直屬節點、通道和數字驗證規則。
+private final class BatchCurveXMLReader: NSObject, XMLParserDelegate {
+    private(set) var rootName: String?
+    private(set) var rootAttributes: [String: String]?
+    private(set) var curves: [(String?, String)] = []
+
+    private var depth = 0
+    private var activeCurveDepth: Int?
+    private var activeChannel: String?
+    private var activeText = ""
+
+    static func parse(_ data: Data) throws -> BatchCurveXMLReader {
+        let reader = BatchCurveXMLReader()
+        let parser = XMLParser(data: data)
+        parser.delegate = reader
+        guard parser.parse() else {
+            throw parser.parserError ?? CocoaError(.fileReadCorruptFile)
+        }
+        return reader
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?,
+                attributes attributeDict: [String: String] = [:]) {
+        depth += 1
+        if depth == 1 {
+            rootName = elementName
+            rootAttributes = attributeDict
+        } else if depth == 2, elementName == "curve" {
+            activeCurveDepth = depth
+            activeChannel = attributeDict["channel"]
+            activeText = ""
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard activeCurveDepth != nil else { return }
+        activeText += string
+    }
+
+    func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        guard activeCurveDepth != nil,
+              let text = String(data: CDATABlock, encoding: .utf8) else { return }
+        activeText += text
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?) {
+        if depth == activeCurveDepth, elementName == "curve" {
+            curves.append((activeChannel, activeText))
+            activeCurveDepth = nil
+            activeChannel = nil
+            activeText = ""
+        }
+        depth -= 1
+    }
+}
+#endif

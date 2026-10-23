@@ -29,7 +29,7 @@
 "Flash（閃光燈）" = "Flash";
 "Fluorescent（螢光燈）" = "Fluorescent";
 "ICC 描述檔沒有可用的媒材白點：%@" = "ICC profile has no usable media white point: %@";
-"JPEG HDR gain map 需要 macOS 15 或更新版本" = "JPEG HDR gain map requires macOS 15 or later";
+"JPEG HDR gain map 需要 macOS 15 或 iOS 18 或更新版本" = "JPEG HDR gain map requires macOS 15 or iOS 18 or later";
 "JPEG HDR 缺少 HDR auxiliary image" = "JPEG HDR is missing the HDR auxiliary image";
 "Metal shader 缺少函式：%@" = "Metal shader is missing function: %@";
 "RAW 內嵌" = "Embedded in RAW";

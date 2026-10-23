@@ -386,6 +386,8 @@ public struct BatchExporter: Sendable {
     func prepare(decoded: DecodedRaw, settings: BatchExportSettings, exposureEV: Double?,
                  maxDimension: Int? = nil,
                  reusableAnalyses: ExposureMatchAnalyses? = nil) async throws -> Prepared {
+        let performanceInterval = RFPerformance.begin("RAWPrepare")
+        defer { RFPerformance.end("RAWPrepare", performanceInterval) }
         var parameters = EditParameters()
         parameters.applyProfile(settings.profile)
         parameters.film = settings.film
@@ -453,73 +455,78 @@ public struct BatchExporter: Sendable {
             parameters.layerA.whiteBalance.select(preset)
         }
 
-        var sceneLinear = try pipeline.reconstruct(decoded: decoded, parameters: parameters,
-                                                   maxDimension: maxDimension)
-        if let sky {
-            let mask = sceneLinear.scale == 1 ? sky.mask
-                : sky.mask.transformed(by: CGAffineTransform(scaleX: sceneLinear.scale, y: sceneLinear.scale))
-            sceneLinear = SceneLinearImage(
-                image: AutoExposure.applyRegionalEV(sky.ev, mask: mask, to: sceneLinear.image),
-                metadata: sceneLinear.metadata, versions: sceneLinear.versions,
-                lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
-        }
-        // 臉在全解析度上找，預覽與輸出用同一份遮罩；要在拉直之前做，遮罩座標才對得上。
-        if settings.skinToneLevel > 0 || settings.skinSmoothingLevel > 0,
-           let portrait = PortraitRetouch.analyze(decoded.image, exposureEV: parameters.layerA.exposureEV,
-                                                  context: context) {
-            var image = sceneLinear.image
-            let mask = portrait.mask(fittedTo: image.extent)
-            // 每張臉各自量、各自修正：合照裡每個人的光線可能不同（窗邊、燈下）。
-            if settings.skinToneLevel > 0 {
-                image = PortraitRetouch.correctTone(
-                    image, faces: portrait.faces(fittedTo: image.extent),
-                    transform: RenderPipeline.sceneTransform(for: parameters, metadata: sceneLinear.metadata,
-                                                             autoWhiteBalanceGains: autoWhiteBalanceGains),
-                    level: settings.skinToneLevel, context: context)
+        // await 之後的影像建構使用局部 pool，避免暫存圖跟著整個批次 Task 存活。
+        return try autoreleasepool {
+            var sceneLinear = try pipeline.reconstruct(decoded: decoded, parameters: parameters,
+                                                       maxDimension: maxDimension)
+            if let sky {
+                let mask = sceneLinear.scale == 1 ? sky.mask
+                    : sky.mask.transformed(by: CGAffineTransform(scaleX: sceneLinear.scale, y: sceneLinear.scale))
+                sceneLinear = SceneLinearImage(
+                    image: AutoExposure.applyRegionalEV(sky.ev, mask: mask, to: sceneLinear.image),
+                    metadata: sceneLinear.metadata, versions: sceneLinear.versions,
+                    lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
             }
-            image = PortraitRetouch.smooth(image, mask: mask, faceWidth: portrait.faceWidth(in: image.extent),
-                                           level: settings.skinSmoothingLevel)
-            sceneLinear = SceneLinearImage(
-                image: image, metadata: sceneLinear.metadata, versions: sceneLinear.versions,
-                lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
+            // 臉在全解析度上找，預覽與輸出用同一份遮罩；要在拉直之前做，遮罩座標才對得上。
+            if settings.skinToneLevel > 0 || settings.skinSmoothingLevel > 0,
+               let portrait = PortraitRetouch.analyze(decoded.image, exposureEV: parameters.layerA.exposureEV,
+                                                      context: context) {
+                var image = sceneLinear.image
+                let mask = portrait.mask(fittedTo: image.extent)
+                // 每張臉各自量、各自修正：合照裡每個人的光線可能不同（窗邊、燈下）。
+                if settings.skinToneLevel > 0 {
+                    image = PortraitRetouch.correctTone(
+                        image, faces: portrait.faces(fittedTo: image.extent),
+                        transform: RenderPipeline.sceneTransform(for: parameters, metadata: sceneLinear.metadata,
+                                                                 autoWhiteBalanceGains: autoWhiteBalanceGains),
+                        level: settings.skinToneLevel, context: context)
+                }
+                image = PortraitRetouch.smooth(image, mask: mask, faceWidth: portrait.faceWidth(in: image.extent),
+                                               level: settings.skinSmoothingLevel)
+                sceneLinear = SceneLinearImage(
+                    image: image, metadata: sceneLinear.metadata, versions: sceneLinear.versions,
+                    lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
+            }
+            // 角度在全解析度上偵測，proxy 與正式輸出才會旋轉同樣的角度；天空遮罩已先套好。
+            let straighten = reusableAnalyses?.straightenDegrees
+                ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
+            if straighten != 0 {
+                sceneLinear = SceneLinearImage(
+                    image: AutoStraighten.apply(straighten, to: sceneLinear.image),
+                    metadata: sceneLinear.metadata, versions: sceneLinear.versions,
+                    lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
+            }
+            var master = pipeline.makeSceneMaster(
+                sceneLinear: sceneLinear, parameters: parameters,
+                autoWhiteBalanceGains: autoWhiteBalanceGains
+            )
+            if settings.automaticColor {
+                // 同主程式：統計「色彩引擎尚未作用」的畫面，再套用完整建議。
+                var probe = parameters
+                probe.colorEngine.enabled = false
+                probe.layerA.chroma = 1
+                let stats = ColorEngineOptimizer.statistics(
+                    image: master.image, context: context,
+                    transform: RenderPipeline.sceneTransform(for: probe, metadata: master.metadata,
+                                                             autoWhiteBalanceGains: autoWhiteBalanceGains))
+                parameters.colorEngine = ColorEngineOptimizer.suggest(base: parameters.colorEngine, statistics: stats)
+                master = pipeline.makeSceneMaster(sceneLinear: sceneLinear, parameters: parameters,
+                                                  autoWhiteBalanceGains: autoWhiteBalanceGains)
+            }
+            return Prepared(master: master, parameters: parameters, skyEV: sky?.ev ?? 0,
+                            meteringSources: meteringSources, whiteBalanceFallback: whiteBalanceFallback,
+                            automaticColorApplied: settings.automaticColor,
+                            straightenDegrees: straighten,
+                            neuralNoiseReduction: settings.noiseReduction != nil
+                                && decoded.metadata.decoderVersion.map { $0.hasPrefix("9") } == true)
         }
-        // 角度在全解析度上偵測，proxy 與正式輸出才會旋轉同樣的角度；天空遮罩已先套好。
-        let straighten = reusableAnalyses?.straightenDegrees
-            ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
-        if straighten != 0 {
-            sceneLinear = SceneLinearImage(
-                image: AutoStraighten.apply(straighten, to: sceneLinear.image),
-                metadata: sceneLinear.metadata, versions: sceneLinear.versions,
-                lensResolution: sceneLinear.lensResolution, scale: sceneLinear.scale)
-        }
-        var master = pipeline.makeSceneMaster(
-            sceneLinear: sceneLinear, parameters: parameters,
-            autoWhiteBalanceGains: autoWhiteBalanceGains
-        )
-        if settings.automaticColor {
-            // 同主程式：統計「色彩引擎尚未作用」的畫面，再套用完整建議。
-            var probe = parameters
-            probe.colorEngine.enabled = false
-            probe.layerA.chroma = 1
-            let stats = ColorEngineOptimizer.statistics(
-                image: master.image, context: context,
-                transform: RenderPipeline.sceneTransform(for: probe, metadata: master.metadata,
-                                                         autoWhiteBalanceGains: autoWhiteBalanceGains))
-            parameters.colorEngine = ColorEngineOptimizer.suggest(base: parameters.colorEngine, statistics: stats)
-            master = pipeline.makeSceneMaster(sceneLinear: sceneLinear, parameters: parameters,
-                                              autoWhiteBalanceGains: autoWhiteBalanceGains)
-        }
-        return Prepared(master: master, parameters: parameters, skyEV: sky?.ev ?? 0,
-                        meteringSources: meteringSources, whiteBalanceFallback: whiteBalanceFallback,
-                        automaticColorApplied: settings.automaticColor,
-                        straightenDegrees: straighten,
-                        neuralNoiseReduction: settings.noiseReduction != nil
-                            && decoded.metadata.decoderVersion.map { $0.hasPrefix("9") } == true)
     }
 
     func prepareProcessed(decoded: DecodedProcessedImage, settings: BatchExportSettings,
                           exposureEV: Double?,
                           reusableAnalyses: ExposureMatchAnalyses? = nil) async throws -> PreparedProcessed {
+        let performanceInterval = RFPerformance.begin("ProcessedPrepare")
+        defer { RFPerformance.end("ProcessedPrepare", performanceInterval) }
         var parameters = ProcessedImageRenderer.defaults()
         if settings.profile != .natural {
             parameters.applyProfile(settings.profile)
@@ -572,7 +579,9 @@ public struct BatchExporter: Sendable {
                 if let mask = map.sky, let skyMedian {
                     skyEV = AutoExposure.skyEV(skyMedian: skyMedian, globalEV: analyzedExposureEV)
                     if skyEV != 0 {
-                        sourceImage = AutoExposure.applyRegionalEV(skyEV, mask: mask, to: sourceImage)
+                        sourceImage = autoreleasepool {
+                            AutoExposure.applyRegionalEV(skyEV, mask: mask, to: sourceImage)
+                        }
                         sourceWasTransformed = true
                     }
                 }
@@ -586,81 +595,83 @@ public struct BatchExporter: Sendable {
             parameters.layerA.exposureEV = analyzedExposureEV
         }
 
-        var autoWhiteBalanceGains: SIMD3<Double>?
-        var whiteBalanceFallback = false
-        switch settings.whiteBalance {
-        case .camera:
-            break
-        case .automatic, .preset(.auto):
-            parameters.layerA.whiteBalance.select(.auto)
-            let result = reusableAnalyses?.autoWhiteBalance
-                ?? AutoWhiteBalance.analyze(decoded.image, context: context)
-            autoWhiteBalanceGains = result.gains
-            whiteBalanceFallback = result.usedFallback
-        case .preset(let preset):
-            parameters.layerA.whiteBalance.select(preset)
-        }
-
-        if settings.skinToneLevel > 0 || settings.skinSmoothingLevel > 0,
-           let portrait = PortraitRetouch.analyze(sourceImage, exposureEV: parameters.layerA.exposureEV,
-                                                  context: context) {
-            var image = sourceImage
-            let mask = portrait.mask(fittedTo: image.extent)
-            var transformMetadata = decoded.metadata
-            transformMetadata.neutralTemperature = transformMetadata.neutralTemperature ?? 6500
-            transformMetadata.neutralTint = transformMetadata.neutralTint ?? 0
-            if settings.skinToneLevel > 0 {
-                image = PortraitRetouch.correctTone(
-                    image, faces: portrait.faces(fittedTo: image.extent),
-                    transform: RenderPipeline.sceneTransform(for: parameters, metadata: transformMetadata,
-                                                             autoWhiteBalanceGains: autoWhiteBalanceGains),
-                    level: settings.skinToneLevel, context: context)
+        return try autoreleasepool {
+            var autoWhiteBalanceGains: SIMD3<Double>?
+            var whiteBalanceFallback = false
+            switch settings.whiteBalance {
+            case .camera:
+                break
+            case .automatic, .preset(.auto):
+                parameters.layerA.whiteBalance.select(.auto)
+                let result = reusableAnalyses?.autoWhiteBalance
+                    ?? AutoWhiteBalance.analyze(decoded.image, context: context)
+                autoWhiteBalanceGains = result.gains
+                whiteBalanceFallback = result.usedFallback
+            case .preset(let preset):
+                parameters.layerA.whiteBalance.select(preset)
             }
-            if settings.skinSmoothingLevel > 0 {
-                image = PortraitRetouch.smooth(image, mask: mask,
-                                               faceWidth: portrait.faceWidth(in: image.extent),
-                                               level: settings.skinSmoothingLevel)
+
+            if settings.skinToneLevel > 0 || settings.skinSmoothingLevel > 0,
+               let portrait = PortraitRetouch.analyze(sourceImage, exposureEV: parameters.layerA.exposureEV,
+                                                      context: context) {
+                var image = sourceImage
+                let mask = portrait.mask(fittedTo: image.extent)
+                var transformMetadata = decoded.metadata
+                transformMetadata.neutralTemperature = transformMetadata.neutralTemperature ?? 6500
+                transformMetadata.neutralTint = transformMetadata.neutralTint ?? 0
+                if settings.skinToneLevel > 0 {
+                    image = PortraitRetouch.correctTone(
+                        image, faces: portrait.faces(fittedTo: image.extent),
+                        transform: RenderPipeline.sceneTransform(for: parameters, metadata: transformMetadata,
+                                                                 autoWhiteBalanceGains: autoWhiteBalanceGains),
+                        level: settings.skinToneLevel, context: context)
+                }
+                if settings.skinSmoothingLevel > 0 {
+                    image = PortraitRetouch.smooth(image, mask: mask,
+                                                   faceWidth: portrait.faceWidth(in: image.extent),
+                                                   level: settings.skinSmoothingLevel)
+                }
+                sourceImage = image
+                sourceWasTransformed = true
             }
-            sourceImage = image
-            sourceWasTransformed = true
-        }
 
-        let straighten = reusableAnalyses?.straightenDegrees
-            ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
-        if straighten != 0 {
-            sourceImage = AutoStraighten.apply(straighten, to: sourceImage)
-            sourceWasTransformed = true
-        }
+            let straighten = reusableAnalyses?.straightenDegrees
+                ?? (settings.automaticStraighten ? AutoStraighten.detect(decoded.image, context: context) ?? 0 : 0)
+            if straighten != 0 {
+                sourceImage = AutoStraighten.apply(straighten, to: sourceImage)
+                sourceWasTransformed = true
+            }
 
-        if settings.automaticColor {
-            parameters.colorEngine.enabled = true
-            var probe = parameters
-            probe.colorEngine.enabled = false
-            probe.layerA.chroma = 1
-            var transformMetadata = decoded.metadata
-            transformMetadata.neutralTemperature = transformMetadata.neutralTemperature ?? 6500
-            transformMetadata.neutralTint = transformMetadata.neutralTint ?? 0
-            let stats = ColorEngineOptimizer.statistics(
-                image: sourceImage, context: context,
-                transform: RenderPipeline.sceneTransform(for: probe, metadata: transformMetadata,
-                                                         autoWhiteBalanceGains: autoWhiteBalanceGains))
-            parameters.colorEngine = ColorEngineOptimizer.suggest(base: parameters.colorEngine,
-                                                                   statistics: stats)
-        }
+            if settings.automaticColor {
+                parameters.colorEngine.enabled = true
+                var probe = parameters
+                probe.colorEngine.enabled = false
+                probe.layerA.chroma = 1
+                var transformMetadata = decoded.metadata
+                transformMetadata.neutralTemperature = transformMetadata.neutralTemperature ?? 6500
+                transformMetadata.neutralTint = transformMetadata.neutralTint ?? 0
+                let stats = ColorEngineOptimizer.statistics(
+                    image: sourceImage, context: context,
+                    transform: RenderPipeline.sceneTransform(for: probe, metadata: transformMetadata,
+                                                             autoWhiteBalanceGains: autoWhiteBalanceGains))
+                parameters.colorEngine = ColorEngineOptimizer.suggest(base: parameters.colorEngine,
+                                                                       statistics: stats)
+            }
 
-        try Task.checkCancellation()
-        let source = DecodedProcessedImage(
-            url: decoded.url, image: sourceImage, metadata: decoded.metadata,
-            colorSpace: decoded.colorSpace, info: decoded.info,
-            colorManagedImage: sourceWasTransformed ? nil : decoded.colorManagedImage
-        )
-        return PreparedProcessed(source: source, parameters: parameters,
-                                 exposureEV: analyzedExposureEV, skyEV: skyEV,
-                                 meteringSources: meteringSources,
-                                 autoWhiteBalanceGains: autoWhiteBalanceGains,
-                                 whiteBalanceFallback: whiteBalanceFallback,
-                                 automaticColorApplied: settings.automaticColor,
-                                 straightenDegrees: straighten)
+            try Task.checkCancellation()
+            let source = DecodedProcessedImage(
+                url: decoded.url, image: sourceImage, metadata: decoded.metadata,
+                colorSpace: decoded.colorSpace, info: decoded.info,
+                colorManagedImage: sourceWasTransformed ? nil : decoded.colorManagedImage
+            )
+            return PreparedProcessed(source: source, parameters: parameters,
+                                     exposureEV: analyzedExposureEV, skyEV: skyEV,
+                                     meteringSources: meteringSources,
+                                     autoWhiteBalanceGains: autoWhiteBalanceGains,
+                                     whiteBalanceFallback: whiteBalanceFallback,
+                                     automaticColorApplied: settings.automaticColor,
+                                     straightenDegrees: straighten)
+        }
     }
 
     private func result(_ prepared: PreparedProcessed, outputURL: URL,
@@ -864,12 +875,20 @@ public struct BatchExporter: Sendable {
     /// 用目前設定產生 SDR 縮圖，給批次前預覽。輸出尺寸與超解析度不影響預覽。
     public func preview(rawURL: URL, settings: BatchExportSettings,
                         maxDimension: Int) async throws -> (image: CGImage, result: BatchExportResult) {
+        let performanceInterval = RFPerformance.begin("Preview")
+        defer { RFPerformance.end("Preview", performanceInterval) }
+        // JPEG／HEIC 預覽只解出兩倍預覽尺寸，60MP 原圖不必整張解碼；最後一步仍由原本的
+        // 高品質縮小產生預覽，外觀才與全解碼一致。RAW 仍走全解析度。
+        let isProcessed = ProcessedImageDecoder.isSupported(rawURL)
+        let decodeLimit = maxDimension > 0 ? maxDimension * 2 : nil
         let decoded = try previewSourceCache.source(
-            for: rawURL, noiseReduction: settings.noiseReduction
+            for: rawURL, noiseReduction: settings.noiseReduction,
+            maxPixelSize: isProcessed ? decodeLimit : nil
         ) {
-            if ProcessedImageDecoder.isSupported(rawURL) {
+            if isProcessed {
                 return .processed(try ProcessedImageDecoder().decode(url: rawURL,
-                                                                      context: pipeline.gpu.ciContext))
+                                                                      context: pipeline.gpu.ciContext,
+                                                                      maxPixelSize: decodeLimit))
             }
             return .raw(try pipeline.decoder.decode(url: rawURL,
                                                     luminanceNoiseReduction: settings.noiseReduction))
@@ -879,38 +898,44 @@ public struct BatchExporter: Sendable {
         case .processed(let imageSource):
             let decoded = imageSource
             let prepared = try await prepareProcessed(decoded: decoded, settings: settings, exposureEV: nil)
-            let target = RenderingTarget.preset(.appleSDR)
-            let rendered = try processedRenderer.render(source: prepared.source,
-                                                         parameters: prepared.parameters,
-                                                         target: target, maxDimension: maxDimension,
-                                                         autoWhiteBalanceGains: prepared.autoWhiteBalanceGains)
-            try Task.checkCancellation()
-            guard let image = pipeline.gpu.ciContext.createCGImage(
-                rendered, from: rendered.extent, format: .RGBA8,
-                colorSpace: RenderPipeline.colorSpace(for: target)) else {
-                throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
+            return try autoreleasepool {
+                let target = RenderingTarget.preset(.appleSDR)
+                let rendered = try processedRenderer.render(source: prepared.source,
+                                                             parameters: prepared.parameters,
+                                                             target: target, maxDimension: maxDimension,
+                                                             autoWhiteBalanceGains: prepared.autoWhiteBalanceGains)
+                try Task.checkCancellation()
+                guard let image = pipeline.gpu.ciContext.createCGImage(
+                    rendered, from: rendered.extent, format: .RGBA8,
+                    colorSpace: RenderPipeline.colorSpace(for: target)) else {
+                    throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
+                }
+                return (image, result(prepared, outputURL: rawURL, superResolved: false))
             }
-            return (image, result(prepared, outputURL: rawURL, superResolved: false))
         case .raw(let rawSource):
             let prepared = try await prepare(decoded: rawSource, settings: settings, exposureEV: nil,
                                              maxDimension: maxDimension)
-            try Task.checkCancellation()
-            let target = RenderingTarget.preset(.appleSDR)
-            let rendered = try pipeline.render(sceneMaster: prepared.master, parameters: prepared.parameters,
-                                               target: target)
-            try Task.checkCancellation()
-            guard let image = pipeline.gpu.ciContext.createCGImage(
-                rendered, from: rendered.extent, format: .RGBA8,
-                colorSpace: RenderPipeline.colorSpace(for: target)) else {
-                throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
+            return try autoreleasepool {
+                try Task.checkCancellation()
+                let target = RenderingTarget.preset(.appleSDR)
+                let rendered = try pipeline.render(sceneMaster: prepared.master, parameters: prepared.parameters,
+                                                   target: target)
+                try Task.checkCancellation()
+                guard let image = pipeline.gpu.ciContext.createCGImage(
+                    rendered, from: rendered.extent, format: .RGBA8,
+                    colorSpace: RenderPipeline.colorSpace(for: target)) else {
+                    throw ExportError.encodingFailed(String(localized: "無法產生預覽", bundle: .module))
+                }
+                return (image, result(prepared, outputURL: rawURL, superResolved: false))
             }
-            return (image, result(prepared, outputURL: rawURL, superResolved: false))
         }
     }
 
     @discardableResult
     public func process(rawURL: URL, outputURL: URL, settings: BatchExportSettings,
                         exposureEV: Double? = nil) async throws -> BatchExportResult {
+        let performanceInterval = RFPerformance.begin("BatchExport")
+        defer { RFPerformance.end("BatchExport", performanceInterval) }
         previewSourceCache.removeAll()
         let files = FileManager.default
         guard !files.fileExists(atPath: outputURL.path) else {
@@ -932,57 +957,59 @@ public struct BatchExporter: Sendable {
             preparedRaw = try await prepare(decoded: decoded, settings: settings, exposureEV: exposureEV)
             preparedProcessed = nil
         }
-        try Task.checkCancellation()
-        let context = pipeline.gpu.ciContext
-        let metadata = BatchMetadata.outputProperties(fromRaw: rawURL)
-        // JPEG HDR 的主圖是 SDR，HDR 資訊放在 gain map 輔助圖（同 `Exporter.exportFullResolution`）。
-        let jpegHDR = settings.exporterFormat == .jpegHDR
-        func render(_ target: RenderingTarget, outputColorSpace: CGColorSpace? = nil) throws -> CIImage {
-            if let preparedRaw {
-                return try pipeline.render(sceneMaster: preparedRaw.master,
-                                           parameters: preparedRaw.parameters, target: target,
-                                           outputColorSpace: outputColorSpace)
+        return try autoreleasepool {
+            try Task.checkCancellation()
+            let context = pipeline.gpu.ciContext
+            let metadata = BatchMetadata.outputProperties(fromRaw: rawURL)
+            // JPEG HDR 的主圖是 SDR，HDR 資訊放在 gain map 輔助圖（同 `Exporter.exportFullResolution`）。
+            let jpegHDR = settings.exporterFormat == .jpegHDR
+            func render(_ target: RenderingTarget, outputColorSpace: CGColorSpace? = nil) throws -> CIImage {
+                if let preparedRaw {
+                    return try pipeline.render(sceneMaster: preparedRaw.master,
+                                               parameters: preparedRaw.parameters, target: target,
+                                               outputColorSpace: outputColorSpace)
+                }
+                if let preparedProcessed {
+                    return try self.processedRenderer.render(source: preparedProcessed.source,
+                                                             parameters: preparedProcessed.parameters, target: target,
+                                                             autoWhiteBalanceGains: preparedProcessed.autoWhiteBalanceGains)
+                }
+                throw ExportError.encodingFailed(String(localized: "無法啟動圖片渲染器", bundle: .module))
             }
+            let primaryTarget = jpegHDR ? RenderingTarget.preset(.appleSDR) : settings.target
+            let rendered = try render(primaryTarget)
+            let (image, superResolved) = try Self.finalImage(rendered, settings: settings, context: context)
+            try Task.checkCancellation()
+            var hdrImage: CIImage?
+            if jpegHDR {
+                let auxiliaryTarget = Exporter.jpegHDRAuxiliaryTarget(for: settings.target)
+                let hdr = try render(auxiliaryTarget, outputColorSpace: pipeline.gpu.workingColorSpace)
+                let linearHDR: CIImage
+                if preparedProcessed != nil {
+                    linearHDR = try linearWorkingImage(hdr, taggedWith: RenderPipeline.colorSpace(for: auxiliaryTarget),
+                                                       context: context)
+                } else {
+                    linearHDR = hdr
+                }
+                hdrImage = Self.resize(linearHDR, toPixelSize: image.extent.size)
+            }
+            let temporary = outputURL.deletingLastPathComponent().appendingPathComponent(
+                ".\(UUID().uuidString)-\(outputURL.lastPathComponent)"
+            )
+            defer { try? files.removeItem(at: temporary) }
+            try exporter.write(image: image.settingProperties(metadata), to: temporary, target: settings.target,
+                               format: settings.exporterFormat, quality: settings.quality, hdrImage: hdrImage)
+            try Task.checkCancellation()
+            guard !files.fileExists(atPath: outputURL.path) else {
+                throw BatchExportError.outputAlreadyExists(outputURL)
+            }
+            try files.moveItem(at: temporary, to: outputURL)
+            if let preparedRaw { return result(preparedRaw, outputURL: outputURL, superResolved: superResolved) }
             if let preparedProcessed {
-                return try self.processedRenderer.render(source: preparedProcessed.source,
-                                                         parameters: preparedProcessed.parameters, target: target,
-                                                         autoWhiteBalanceGains: preparedProcessed.autoWhiteBalanceGains)
+                return result(preparedProcessed, outputURL: outputURL, superResolved: superResolved)
             }
-            throw ExportError.encodingFailed(String(localized: "無法啟動圖片渲染器", bundle: .module))
+            throw ExportError.encodingFailed(String(localized: "無法建立輸出結果", bundle: .module))
         }
-        let primaryTarget = jpegHDR ? RenderingTarget.preset(.appleSDR) : settings.target
-        let rendered = try render(primaryTarget)
-        let (image, superResolved) = try Self.finalImage(rendered, settings: settings, context: context)
-        try Task.checkCancellation()
-        var hdrImage: CIImage?
-        if jpegHDR {
-            let auxiliaryTarget = Exporter.jpegHDRAuxiliaryTarget(for: settings.target)
-            let hdr = try render(auxiliaryTarget, outputColorSpace: pipeline.gpu.workingColorSpace)
-            let linearHDR: CIImage
-            if preparedProcessed != nil {
-                linearHDR = try linearWorkingImage(hdr, taggedWith: RenderPipeline.colorSpace(for: auxiliaryTarget),
-                                                   context: context)
-            } else {
-                linearHDR = hdr
-            }
-            hdrImage = Self.resize(linearHDR, toPixelSize: image.extent.size)
-        }
-        let temporary = outputURL.deletingLastPathComponent().appendingPathComponent(
-            ".\(UUID().uuidString)-\(outputURL.lastPathComponent)"
-        )
-        defer { try? files.removeItem(at: temporary) }
-        try exporter.write(image: image.settingProperties(metadata), to: temporary, target: settings.target,
-                           format: settings.exporterFormat, quality: settings.quality, hdrImage: hdrImage)
-        try Task.checkCancellation()
-        guard !files.fileExists(atPath: outputURL.path) else {
-            throw BatchExportError.outputAlreadyExists(outputURL)
-        }
-        try files.moveItem(at: temporary, to: outputURL)
-        if let preparedRaw { return result(preparedRaw, outputURL: outputURL, superResolved: superResolved) }
-        if let preparedProcessed {
-            return result(preparedProcessed, outputURL: outputURL, superResolved: superResolved)
-        }
-        throw ExportError.encodingFailed(String(localized: "無法建立輸出結果", bundle: .module))
     }
 
     /// 將已成像來源的 HDR 輔助圖重新標記為 pipeline 使用的線性 Rec.2020。

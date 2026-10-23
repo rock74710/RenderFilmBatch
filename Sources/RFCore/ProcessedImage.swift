@@ -109,11 +109,34 @@ public struct ProcessedImageDecoder: Sendable {
         )
     }
 
-    public func decode(url: URL, context: CIContext) throws -> DecodedProcessedImage {
+    /// `maxPixelSize` 給預覽用：由 Image I/O 直接解出長邊不超過此值的縮圖，不先解出整張原圖。
+    public func decode(url: URL, context: CIContext, maxPixelSize: Int? = nil) throws -> DecodedProcessedImage {
+        try autoreleasepool {
+            try decodeSource(url: url, context: context, maxPixelSize: maxPixelSize)
+        }
+    }
+
+    private func decodeSource(url: URL, context: CIContext, maxPixelSize: Int?) throws -> DecodedProcessedImage {
+        let performanceInterval = RFPerformance.begin("ProcessedDecode")
+        defer { RFPerformance.end("ProcessedDecode", performanceInterval) }
         let source = try imageSource(at: url)
         let info = try information(source: source, url: url)
-        guard let cgImage = CGImageSourceCreateImageAtIndex(source, 0, Self.decodeOptions()) else {
-            throw ProcessedImageError.corruptImage(url)
+        var width = info.width, height = info.height
+        let cgImage: CGImage
+        if let maxPixelSize, maxPixelSize > 0, maxPixelSize < max(info.width, info.height) {
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+                source, 0, Self.reducedDecodeOptions(maxPixelSize: maxPixelSize)) else {
+                throw ProcessedImageError.corruptImage(url)
+            }
+            let swapsAxes = (5...8).contains(info.sourceOrientation)
+            width = swapsAxes ? thumbnail.height : thumbnail.width
+            height = swapsAxes ? thumbnail.width : thumbnail.height
+            cgImage = thumbnail
+        } else {
+            guard let full = CGImageSourceCreateImageAtIndex(source, 0, Self.decodeOptions()) else {
+                throw ProcessedImageError.corruptImage(url)
+            }
+            cgImage = full
         }
 
         let sourceColorSpace = cgImage.colorSpace
@@ -130,7 +153,7 @@ public struct ProcessedImageDecoder: Sendable {
         let oriented = decoded.oriented(forExifOrientation: Int32(info.sourceOrientation))
         let orientedExtent = oriented.extent.integral
         guard orientedExtent.width > 0, orientedExtent.height > 0,
-              orientedExtent.width == CGFloat(info.width), orientedExtent.height == CGFloat(info.height) else {
+              orientedExtent.width == CGFloat(width), orientedExtent.height == CGFloat(height) else {
             throw ProcessedImageError.invalidDimensions(url)
         }
         let normalized = oriented.transformed(by: CGAffineTransform(
@@ -146,13 +169,13 @@ public struct ProcessedImageDecoder: Sendable {
         let linearImage = CIImage(cgImage: linearCGImage, options: [.colorSpace: linearSpace])
         var metadata = RawMetadata.from(imageProperties: Self.properties(source: source))
         metadata.orientation = 1 // Orientation has already been applied to `image` exactly once.
-        metadata.pixelWidth = info.width
-        metadata.pixelHeight = info.height
+        metadata.pixelWidth = width
+        metadata.pixelHeight = height
         metadata.colorProfileName = info.colorProfileName
         metadata.decoderVersion = "ImageIO SDR"
         return DecodedProcessedImage(url: url, image: linearImage, metadata: metadata,
                                      colorSpace: linearSpace, info: ProcessedImageInfo(
-            format: info.format, width: info.width, height: info.height,
+            format: info.format, width: width, height: height,
             sourceOrientation: info.sourceOrientation, sourceTypeIdentifier: info.sourceTypeIdentifier,
             colorProfileName: info.colorProfileName, colorSpaceFallback: fallback
         ), colorManagedImage: normalized)
@@ -160,6 +183,16 @@ public struct ProcessedImageDecoder: Sendable {
 
     private static func decodeOptions() -> CFDictionary {
         [
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR,
+        ] as CFDictionary
+    }
+
+    private static func reducedDecodeOptions(maxPixelSize: Int) -> CFDictionary {
+        [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: false,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
             kCGImageSourceShouldCacheImmediately: true,
             kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR,
         ] as CFDictionary
@@ -233,11 +266,16 @@ public final class ProcessedImageRenderer: @unchecked Sendable {
     private let targetLUTCache = LUTCache()
     private let fullLUTCache = LUTCache()
 
-    public init(gpu: GPUContext, profileManager: OpticalProfileManager? = nil) throws {
+    public convenience init(gpu: GPUContext, profileManager: OpticalProfileManager? = nil) throws {
+        try self.init(gpu: gpu, profileManager: profileManager, lutRenderer: LUTRenderer(gpu: gpu))
+    }
+
+    init(gpu: GPUContext, profileManager: OpticalProfileManager? = nil,
+         lutRenderer: LUTRenderer) throws {
         self.gpu = gpu
         self.profileManager = profileManager ?? OpticalProfileManager(database: LensfunDatabase.loadDefault())
         self.optical = try OpticalRenderer(gpu: gpu)
-        self.lutRenderer = try LUTRenderer(gpu: gpu)
+        self.lutRenderer = lutRenderer
         self.maskRenderer = try MaskRenderer()
         self.spatialRenderer = try SpatialRenderer()
     }
@@ -253,6 +291,8 @@ public final class ProcessedImageRenderer: @unchecked Sendable {
     public func render(source: DecodedProcessedImage, parameters: EditParameters,
                        target: RenderingTarget? = nil, maxDimension: Int? = nil,
                        autoWhiteBalanceGains: SIMD3<Double>? = nil) throws -> CIImage {
+        let performanceInterval = RFPerformance.begin("ProcessedRenderGraph")
+        defer { RFPerformance.end("ProcessedRenderGraph", performanceInterval) }
         let parameters = parameters.effective
         let target = target ?? parameters.target
         if target.dynamicRange == .sdr, target.transferFunction == .sRGB,

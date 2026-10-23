@@ -69,6 +69,7 @@ final class BatchPreviewSourceCache: @unchecked Sendable {
     private struct Key: Hashable {
         let file: FileStamp
         let noiseReductionBits: UInt64?
+        let maxPixelSize: Int?
     }
 
     private struct Entry {
@@ -90,7 +91,7 @@ final class BatchPreviewSourceCache: @unchecked Sendable {
         self.entryLimit = max(1, entryLimit)
     }
 
-    func source(for url: URL, noiseReduction: Double?,
+    func source(for url: URL, noiseReduction: Double?, maxPixelSize: Int? = nil,
                 load: () throws -> BatchPreviewSource) throws -> BatchPreviewSource {
         try Task<Never, Never>.checkCancellation()
         guard let file = FileStamp.read(url) else {
@@ -98,7 +99,7 @@ final class BatchPreviewSourceCache: @unchecked Sendable {
             try Task<Never, Never>.checkCancellation()
             return decoded
         }
-        let key = Key(file: file, noiseReductionBits: noiseReduction?.bitPattern)
+        let key = Key(file: file, noiseReductionBits: noiseReduction?.bitPattern, maxPixelSize: maxPixelSize)
 
         var loadEpoch: UInt64 = 0
         condition.lock()

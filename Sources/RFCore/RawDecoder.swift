@@ -56,6 +56,16 @@ public struct RawDecoder: Sendable {
     /// decoder when this camera supports it (Apple's neural noise reduction) and sets the amount.
     public func decode(url: URL, pinnedDecoderVersion: String? = nil,
                        luminanceNoiseReduction: Double? = nil) throws -> DecodedRaw {
+        try autoreleasepool {
+            try decodeSource(url: url, pinnedDecoderVersion: pinnedDecoderVersion,
+                             luminanceNoiseReduction: luminanceNoiseReduction)
+        }
+    }
+
+    private func decodeSource(url: URL, pinnedDecoderVersion: String?,
+                              luminanceNoiseReduction: Double?) throws -> DecodedRaw {
+        let performanceInterval = RFPerformance.begin("RAWDecodeGraph")
+        defer { RFPerformance.end("RAWDecodeGraph", performanceInterval) }
         guard Self.isSupported(url) else { throw RawDecodeError.unsupportedFile(url) }
         guard let filter = CIRAWFilter(imageURL: url) else {
             throw RawDecodeError.cannotCreateFilter(url)

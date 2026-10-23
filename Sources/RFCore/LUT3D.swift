@@ -200,25 +200,39 @@ struct LUTParamsGPU {
     var shaperLo: Float
     var shaperHi: Float
     var lutSize: Float
+    var sourceYOffset: UInt32
 }
 
 /// 在 GPU 上套用 LUT。與 `OpticalRenderer` 共用同一個 command queue。
 public final class LUTRenderer: @unchecked Sendable {
+    private static let maximumSourcePixels = 8 * 1_024 * 1_024
+
     private let gpu: GPUContext
     private let pipeline: MTLComputePipelineState
     private let lutTextureCache: LUTTextureContentCache
+    private let maximumSourceRows: Int?
 
     public convenience init(gpu: GPUContext) throws {
-        try self.init(gpu: gpu, lutTextureCacheEntryLimit: 8, lutTextureCacheByteLimit: 16 * 1_024 * 1_024)
+        try self.init(gpu: gpu, lutTextureCacheEntryLimit: 8,
+                      lutTextureCacheByteLimit: 16 * 1_024 * 1_024,
+                      maximumSourceRows: nil)
     }
 
-    init(gpu: GPUContext, lutTextureCacheEntryLimit: Int, lutTextureCacheByteLimit: Int) throws {
+    convenience init(gpu: GPUContext, maximumSourceRows: Int) throws {
+        try self.init(gpu: gpu, lutTextureCacheEntryLimit: 8,
+                      lutTextureCacheByteLimit: 16 * 1_024 * 1_024,
+                      maximumSourceRows: maximumSourceRows)
+    }
+
+    init(gpu: GPUContext, lutTextureCacheEntryLimit: Int, lutTextureCacheByteLimit: Int,
+         maximumSourceRows: Int? = nil) throws {
         self.gpu = gpu
         self.pipeline = try gpu.makePipeline(function: "rf_apply_lut")
         self.lutTextureCache = LUTTextureContentCache(
             maximumEntries: lutTextureCacheEntryLimit,
             maximumBytes: lutTextureCacheByteLimit
         )
+        self.maximumSourceRows = maximumSourceRows.map { max(1, $0) }
     }
 
     var resourceStats: LUTResourceStats {
@@ -238,6 +252,8 @@ public final class LUTRenderer: @unchecked Sendable {
     }
 
     public func apply(to image: CIImage, lut: LUT3D, outputColorSpace: CGColorSpace) throws -> CIImage {
+        let performanceInterval = RFPerformance.begin("LUTSynchronous")
+        defer { RFPerformance.end("LUTSynchronous", performanceInterval) }
         let extent = image.extent.isInfinite
             ? CGRect(x: 0, y: 0, width: 2048, height: 2048) : image.extent
         guard extent.width.isFinite, extent.height.isFinite,
@@ -247,51 +263,57 @@ public final class LUTRenderer: @unchecked Sendable {
         guard w > 0, h > 0,
               let lutTexture = lutTextureCache.texture(for: lut, device: gpu.device) else { return image }
 
-        let source = try gpu.acquireSourceScratch(width: w, height: h)
-        var sourceReturned = false
-        func returnSourceAfterCompletion() {
-            guard !sourceReturned else { return }
-            sourceReturned = true
-            gpu.recycleSourceScratch(source)
-        }
-        defer { returnSourceAfterCompletion() }
-
         let dest = try gpu.makeTexture(width: w, height: h)
-        guard let buffer = gpu.commandQueue.makeCommandBuffer() else { return image }
+        let rowsByPixelBudget = max(1, Self.maximumSourcePixels / w)
+        let stripHeight = min(h, maximumSourceRows ?? rowsByPixelBudget)
+        var yOffset = 0
+        while yOffset < h {
+            let rows = min(stripHeight, h - yOffset)
+            let source = try gpu.acquireSourceScratch(width: w, height: rows)
+            guard let buffer = gpu.commandQueue.makeCommandBuffer() else {
+                gpu.recycleSourceScratch(source)
+                return image
+            }
 
-        gpu.ciContext.render(
-            image.transformed(by: CGAffineTransform(translationX: -extent.origin.x,
-                                                    y: -extent.origin.y)),
-            to: source,
-            commandBuffer: buffer,
-            bounds: CGRect(x: 0, y: 0, width: w, height: h),
-            colorSpace: gpu.workingColorSpace
-        )
+            let translated = image.transformed(by: CGAffineTransform(
+                translationX: -extent.origin.x,
+                y: -(extent.origin.y + CGFloat(yOffset))
+            ))
+            gpu.ciContext.render(
+                translated,
+                to: source,
+                commandBuffer: buffer,
+                bounds: CGRect(x: 0, y: 0, width: w, height: rows),
+                colorSpace: gpu.workingColorSpace
+            )
 
-        var params = LUTParamsGPU(
-            shaperLo: Float(LUT3D.shaperLo),
-            shaperHi: Float(LUT3D.shaperHi),
-            lutSize: Float(lut.size)
-        )
-        guard let enc = buffer.makeComputeCommandEncoder() else {
+            var params = LUTParamsGPU(
+                shaperLo: Float(LUT3D.shaperLo),
+                shaperHi: Float(LUT3D.shaperHi),
+                lutSize: Float(lut.size),
+                sourceYOffset: UInt32(yOffset)
+            )
+            guard let enc = buffer.makeComputeCommandEncoder() else {
+                buffer.commit()
+                buffer.waitUntilCompleted()
+                gpu.recycleSourceScratch(source)
+                return image
+            }
+            enc.setComputePipelineState(pipeline)
+            enc.setTexture(source, index: 0)
+            enc.setTexture(dest, index: 1)
+            enc.setTexture(lutTexture, index: 2)
+            enc.setBytes(&params, length: MemoryLayout<LUTParamsGPU>.stride, index: 0)
+            enc.dispatchThreadgroups(
+                MTLSize(width: (w + 15) / 16, height: (rows + 15) / 16, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+            )
+            enc.endEncoding()
             buffer.commit()
             buffer.waitUntilCompleted()
-            returnSourceAfterCompletion()
-            return image
+            gpu.recycleSourceScratch(source)
+            yOffset += rows
         }
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(source, index: 0)
-        enc.setTexture(dest, index: 1)
-        enc.setTexture(lutTexture, index: 2)
-        enc.setBytes(&params, length: MemoryLayout<LUTParamsGPU>.stride, index: 0)
-        enc.dispatchThreadgroups(
-            MTLSize(width: (w + 15) / 16, height: (h + 15) / 16, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
-        )
-        enc.endEncoding()
-        buffer.commit()
-        buffer.waitUntilCompleted()
-        returnSourceAfterCompletion()
 
         // LUT 輸出已經是目標色域的編碼值，所以掛上目標色彩空間。
         guard let wrapped = CIImage(mtlTexture: dest, options: [.colorSpace: outputColorSpace])

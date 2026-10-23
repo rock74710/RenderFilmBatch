@@ -7,6 +7,34 @@ import XCTest
 @testable import RFCore
 
 final class BatchProcessedImageTests: XCTestCase {
+    func testConcurrentProcessedExportsKeepIndependentPixels() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("input.jpg")
+        try writeImage(to: input, type: .jpeg, width: 1280, height: 720)
+        let gpu = try XCTUnwrap(GPUContext.shared)
+        var settings = BatchExportSettings()
+        settings.format = .jpeg
+        settings.exposureCompensationEV = 0.6
+        let reference = folder.appendingPathComponent("reference.jpg")
+        _ = try await BatchExporter(pipeline: RenderPipeline(gpu: gpu)).process(
+            rawURL: input, outputURL: reference, settings: settings)
+        let first = try BatchExporter(pipeline: RenderPipeline(gpu: gpu))
+        let second = try BatchExporter(pipeline: RenderPipeline(gpu: gpu))
+        let firstURL = folder.appendingPathComponent("first.jpg")
+        let secondURL = folder.appendingPathComponent("second.jpg")
+        async let a = first.process(rawURL: input, outputURL: firstURL, settings: settings)
+        async let b = second.process(rawURL: input, outputURL: secondURL, settings: settings)
+        _ = try await (a, b)
+        func read(_ url: URL) throws -> CGImage {
+            let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+            return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        }
+        let expected = try read(reference)
+        XCTAssertEqual(try maximumChannelDelta(expected, read(firstURL)), 0)
+        XCTAssertEqual(try maximumChannelDelta(expected, read(secondURL)), 0)
+    }
+
     func testJPEGPreviewUsesProcessedImagePath() async throws {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -62,8 +90,30 @@ final class BatchProcessedImageTests: XCTestCase {
         let expectedCG = try XCTUnwrap(gpu.ciContext.createCGImage(
             expected, from: expected.extent, format: .RGBA8,
             colorSpace: RenderPipeline.colorSpace(for: .preset(.appleSDR))))
-        XCTAssertLessThanOrEqual(try maximumChannelDelta(preview.image, expectedCG), 1,
+        // 預覽改由縮圖解碼，取樣位置與全解碼不同，只有邊緣少數像素差較多；方向或色彩錯誤會讓平均差變大。
+        XCTAssertLessThanOrEqual(try maximumChannelDelta(preview.image, expectedCG), 16,
                                  "neutral preview must preserve the full-source orientation and pixels")
+        XCTAssertLessThanOrEqual(try meanChannelDelta(preview.image, expectedCG), 1,
+                                 "neutral preview must preserve the full-source orientation and pixels")
+    }
+
+    func testReducedDecodeKeepsOrientationAndOnlyMaterializesRequestedSize() throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("reduced-rotated.jpg")
+        try writeImage(to: input, type: .jpeg, orientation: 6, width: 640, height: 480)
+
+        let gpu = try XCTUnwrap(GPUContext.shared)
+        let reduced = try ProcessedImageDecoder().decode(url: input, context: gpu.ciContext,
+                                                         maxPixelSize: 120)
+        XCTAssertEqual(reduced.image.extent.size, CGSize(width: 90, height: 120))
+        XCTAssertEqual(reduced.fullSize, CGSize(width: 90, height: 120),
+                       "preview cache cost must follow the reduced pixels")
+
+        let full = try ProcessedImageDecoder().decode(url: input, context: gpu.ciContext,
+                                                      maxPixelSize: 4000)
+        XCTAssertEqual(full.fullSize, CGSize(width: 480, height: 640),
+                       "a limit larger than the source keeps the full decode")
     }
 
     func testConcurrentBatchPreviewsKeepEachProcessedStyleOutput() async throws {
@@ -325,6 +375,15 @@ final class BatchProcessedImageTests: XCTestCase {
     }
 
     private func maximumChannelDelta(_ a: CGImage, _ b: CGImage) throws -> Int {
+        try channelDeltas(a, b).max() ?? 0
+    }
+
+    private func meanChannelDelta(_ a: CGImage, _ b: CGImage) throws -> Double {
+        let deltas = try channelDeltas(a, b)
+        return deltas.isEmpty ? 0 : Double(deltas.reduce(0, +)) / Double(deltas.count)
+    }
+
+    private func channelDeltas(_ a: CGImage, _ b: CGImage) throws -> [Int] {
         XCTAssertEqual(a.width, b.width)
         XCTAssertEqual(a.height, b.height)
         // 先統一色彩空間與通道排列，避免直接比較 TIFF 與預覽不同的位元組格式。
@@ -342,6 +401,6 @@ final class BatchProcessedImageTests: XCTestCase {
             }
             return bytes
         }
-        return zip(try pixels(a), try pixels(b)).map { abs(Int($0) - Int($1)) }.max() ?? 0
+        return zip(try pixels(a), try pixels(b)).map { abs(Int($0) - Int($1)) }
     }
 }
